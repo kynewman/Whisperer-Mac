@@ -1,0 +1,205 @@
+:root {
+  /* Surfaces */
+  --bg-desktop: #2d2a26;
+  --bg: oklch(0.985 0.003 80);
+  --bg-2: oklch(0.972 0.004 80);
+  --bg-sunken: oklch(0.96 0.005 80);
+  --card: #ffffff;
+  --line: oklch(0.91 0.005 80);
+  --line-soft: oklch(0.94 0.004 80);
+  --line-strong: oklch(0.83 0.008 80);
+
+  /* Ink */
+  --ink: oklch(0.22 0.008 80);
+  --ink-1: oklch(0.36 0.008 80);
+  --ink-2: oklch(0.52 0.008 80);
+  --ink-3: oklch(0.66 0.008 80);
+  --ink-4: oklch(0.78 0.006 80);
+
+  /* Accent */
+  --accent: oklch(0.62 0.13 230);
+  --accent-soft: oklch(0.95 0.025 230);
+  --accent-ink: oklch(0.42 0.13 230);
+  --menu-bg: var(--card);
+  --menu-active: var(--bg-sunken);
+  --shadow-menu: 0 10px 26px -14px rgba(20,20,30,0.22), 0 2px 7px rgba(20,20,30,0.06);
+  --keycap-shadow: 0 1px 0 rgba(255,255,255,0.55) inset;
+  --page-pad-x: 28px;
+  --page-pad-y: 22px;
+  --page-pad-bottom: 72px;
+  --row-pad-y: 12px;
+  --card-padding: 18px;
+
+  /* Status */
+  --rec: oklch(0.62 0.18 25);
+  --rec-soft: oklch(0.95 0.03 25);
+  --ok: oklch(0.62 0.13 155);
+  --warn: oklch(0.72 0.13 75);
+
+  /* Effects */
+  --shadow-window: 0 1px 0 rgba(255, 255, 255, 0.6) inset,
+    0 30px 60px -20px rgba(0, 0, 0, 0.45),
+    0 12px 30px -10px rgba(0, 0, 0, 0.35);
+  --shadow-card: none;
+  --radius: 14px;
+  --radius-sm: 9px;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg-desktop);
+  font-family: "Inter Tight", -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Segoe UI", system-ui, sans-serif;
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "ss01", "cv11";
+}
+
+body {
+  background: var(--bg-desktop);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+body[data-theme="dark"] {
+  --bg: oklch(0.18 0.005 260);
+  --bg-2: oklch(0.21 0.006 260);
+  --bg-sunken: oklch(0.15 0.005 260);
+  --card: oklch(0.22 0.006 260);
+  --line: oklch(0.30 0.008 260);
+  --line-soft: oklch(0.26 0.007 260);
+  --line-strong: oklch(0.40 0.010 260);
+  --ink: oklch(0.96 0.005 260);
+  --ink-1: oklch(0.85 0.005 260);
+  --ink-2: oklch(0.68 0.008 260);
+  --ink-3: oklch(0.55 0.010 260);
+  --ink-4: oklch(0.42 0.010 260);
+  --accent-soft: oklch(0.30 0.06 230);
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 6px 20px -8px rgba(0, 0, 0, 0.4);
+  --menu-bg: oklch(0.20 0.006 260);
+  --menu-active: oklch(0.27 0.008 260);
+  --shadow-menu: 0 18px 40px -18px rgba(0,0,0,0.72), 0 1px 0 rgba(255,255,255,0.04) inset;
+  --keycap-shadow: none;
+}
+
+body[data-theme="dark"] {
+  background: #06080b;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mono {
+  font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  font-feature-settings: "ss01", "cv11";
+}
+* {
+  box-sizing: border-box;
+}
+button {
+  font-family: inherit;
+}
+
+body[data-density="compact"] {
+  --page-pad-x: 22px;
+  --page-pad-y: 18px;
+  --page-pad-bottom: 60px;
+  --row-pad-y: 9px;
+  --card-padding: 14px;
+}
+
+.page-shell {
+  padding: var(--page-pad-y) var(--page-pad-x) var(--page-pad-bottom);
+  overflow: auto;
+  height: 100%;
+}
+
+.scroll {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.scroll:hover,
+.scroll:focus-within,
+.scroll.is-scrolling {
+  scrollbar-color: var(--line-strong) transparent;
+}
+.scroll::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+.scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+.scroll::-webkit-scrollbar-corner {
+  background: transparent;
+}
+.scroll::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 999px;
+  border: 4px solid transparent;
+  background-clip: padding-box;
+  min-height: 48px;
+}
+.scroll:hover::-webkit-scrollbar-thumb,
+.scroll:focus-within::-webkit-scrollbar-thumb,
+.scroll.is-scrolling::-webkit-scrollbar-thumb {
+  background-color: var(--line-strong);
+  background-clip: padding-box;
+}
+.scroll:hover::-webkit-scrollbar-thumb:hover {
+  background-color: var(--ink-3);
+  background-clip: padding-box;
+}
+
+@keyframes pageIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.page-enter {
+  animation: none;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.pulse-dot {
+  animation: none;
+}
+
+@keyframes wbar {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}

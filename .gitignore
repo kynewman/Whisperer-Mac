@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+models/
+.env
+*.egg-info/
+dist/
+build/
+.claude/
+Design/
+*.log
+*_log.txt
+whisperer-app/node_modules/
+whisperer-app/release/
+whisperer-app/dist-electron/
+whisperer-app/electron/
+# Local user vocabulary/history databases live outside source control.
+data/
+
