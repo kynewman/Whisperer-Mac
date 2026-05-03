@@ -52,11 +52,24 @@ dictation automatically falls back to the selected local Whisper model.
 ./build_macos.sh
 ```
 
-Output: `dist/Whisperer.app`
+Output:
+
+- `dist/Whisperer.app`
+- `dist/Whisperer-macOS-arm64.dmg`
 
 The build script creates `.venv`, installs macOS dependencies, builds the React
 dashboard into `whisperer-app/dist`, then packages the PyQt shell with
-`whisperer-macos.spec`.
+`whisperer-macos.spec` and creates a drag-to-Applications DMG.
+
+To rebuild only the installer from an existing app bundle:
+
+```bash
+scripts/create_macos_dmg.sh
+```
+
+GitHub source cannot include the DMG directly because the packaged app is larger
+than GitHub's per-file limit. Publish `dist/Whisperer-macOS-arm64.dmg` as a
+GitHub Release asset for user-friendly installation.
 
 ## Project Structure
 

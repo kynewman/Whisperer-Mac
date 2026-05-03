@@ -48,5 +48,7 @@ fi
 
 python -m pip install pyinstaller
 pyinstaller --noconfirm whisperer-macos.spec
+scripts/create_macos_dmg.sh
 
 echo "Built dist/Whisperer.app"
+echo "Built dist/Whisperer-macOS-arm64.dmg"
