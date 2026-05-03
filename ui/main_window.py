@@ -1,7 +1,7 @@
 """Main Whisperer window.
 
 The dashboard is rendered by the React app in ``whisperer-app/dist`` while this
-module keeps ownership of the real Windows/Python behavior: tray integration,
+module keeps ownership of the real native/Python behavior: tray integration,
 engine subprocess lifecycle, settings persistence, GPU selection, and device
 discovery. The dictation overlay remains in the engine process.
 """
@@ -13,22 +13,27 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 import ctypes
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta
 from typing import Any
 
 from PyQt6.QtCore import Qt, QObject, QTimer, QUrl, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QIcon
+from PyQt6.QtGui import QColor, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 
 import config
+from core import hotkeys
+from core.paths import get_app_data_dir
 from core.settings import load_settings, save_settings
 from ui.app_icon import APP_USER_MODEL_ID, app_icon_path
 from ui.overlay import WaveformOverlay
@@ -37,6 +42,7 @@ from ui.tray import TrayIcon
 
 ENGINE_FORCE_STOP_RESTART_CODE = 42
 GPU_AUTO_VALUE = "auto"
+GROQ_RUNTIME_VALUE = "groq_api"
 LOADING_PREVIEW_HIDE_MS = 1400
 LOADING_READY_MORPH_HIDE_MS = 900
 LOADING_INTERACTION_HIDE_RETRY_MS = 450
@@ -57,6 +63,16 @@ QUIET_MODEL_ENV = {
     "PYTHONIOENCODING": "utf-8:replace",
 }
 
+API_KEY_SERVICES = {
+    "openai": "OpenAI",
+    "groq": "Groq",
+    "deepgram": "Deepgram",
+    "nvidia": "NVIDIA",
+    "anthropic": "Anthropic",
+    "openai_compat": "OpenAI-compatible LLM",
+    "openai_compat_stt": "OpenAI-compatible STT",
+}
+
 
 class _DwmMargins(ctypes.Structure):
     _fields_ = [
@@ -67,13 +83,6 @@ class _DwmMargins(ctypes.Structure):
     ]
 
 MODEL_OPTIONS = [
-    {
-        "value": "nvidia/parakeet-unified-en-0.6b",
-        "label": "NVIDIA Parakeet Unified 0.6B",
-        "size": "0.6 B",
-        "badge": "Local",
-        "speed": "Fastest",
-    },
     {
         "value": "deepdml/faster-whisper-large-v3-turbo-ct2",
         "label": "Whisper v3 Turbo",
@@ -88,7 +97,33 @@ MODEL_OPTIONS = [
         "badge": "Local",
         "speed": "Accurate",
     },
+    {
+        "value": "nvidia/parakeet-unified-en-0.6b",
+        "label": "NVIDIA Parakeet Unified 0.6B",
+        "size": "0.6 B",
+        "badge": "Local",
+        "speed": "Fastest",
+    },
 ]
+
+GROQ_STT_MODEL_META = {
+    "whisper-large-v3-turbo": {
+        "label": "Whisper Large v3 Turbo",
+        "price": "$0.04/hr",
+        "hint": "Fastest",
+    },
+    "whisper-large-v3": {
+        "label": "Whisper Large v3",
+        "price": "$0.111/hr",
+        "hint": "Most accurate",
+    },
+}
+
+
+def _available_model_options() -> list[dict[str, str]]:
+    if sys.platform == "darwin":
+        return [item for item in MODEL_OPTIONS if not item["value"].lower().startswith("nvidia/")]
+    return MODEL_OPTIONS
 
 
 def _react_index_url() -> QUrl:
@@ -112,21 +147,8 @@ def _react_index_url() -> QUrl:
 
 
 def _normalize_keyboard_hotkey(hotkey: str | None) -> str | None:
-    """Convert Qt key names into names understood by the keyboard package."""
-    if not hotkey:
-        return hotkey
-
-    parts = []
-    for part in str(hotkey).split("+"):
-        key = part.strip().lower()
-        if key in {"meta", "win", "windows"}:
-            key = "left windows"
-        elif key == "control":
-            key = "ctrl"
-        elif key == "esc":
-            key = "escape"
-        parts.append(key)
-    return "+".join(parts)
+    """Convert UI key names into names understood by the native hotkey backend."""
+    return hotkeys.normalize_hotkey(hotkey)
 
 
 class Bridge(QObject):
@@ -279,6 +301,18 @@ class Bridge(QObject):
             value = value_json
         return self._window.set_setting(section, key, value)
 
+    @pyqtSlot(str, str, result=str)
+    def setApiKey(self, service: str, value: str) -> str:
+        return self._window.set_api_key(service, value)
+
+    @pyqtSlot(str, result=str)
+    def deleteApiKey(self, service: str) -> str:
+        return self._window.delete_api_key(service)
+
+    @pyqtSlot(str, result=str)
+    def testApiKey(self, service: str) -> str:
+        return self._window.test_api_key(service)
+
 
 _BRIDGE_SHIM = r"""
 (function() {
@@ -328,7 +362,10 @@ _BRIDGE_SHIM = r"""
         setShortcut: function(name, value) { return callResult("setShortcut", name, value); },
         setSetting: function(section, key, value) {
           return callResult("setSetting", section, key, JSON.stringify(value));
-        }
+        },
+        setApiKey: function(service, value) { return callResult("setApiKey", service, value || ""); },
+        deleteApiKey: function(service) { return callResult("deleteApiKey", service); },
+        testApiKey: function(service) { return callResult("testApiKey", service); }
       };
       b.engineStateChanged.connect(function(state) {
         window.dispatchEvent(new CustomEvent("whisperer:engineState", { detail: state }));
@@ -366,7 +403,7 @@ class DiagnosticPage(QWebEnginePage):
 
 
 class MainWindow(QMainWindow):
-    """Frameless WebEngine host for the React UI."""
+    """WebEngine host for the React UI."""
 
     loadingPreviewRequested = pyqtSignal()
     backupTranscriptionFinished = pyqtSignal(str, bool, str, str)
@@ -375,12 +412,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"Whisperer v{config.VERSION}")
         self.setWindowIcon(QIcon(app_icon_path()))
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        if sys.platform == "darwin":
+            self.setWindowFlags(Qt.WindowType.Window)
+            try:
+                self.setUnifiedTitleAndToolBarOnMac(True)
+            except Exception:
+                pass
+        else:
+            self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setMinimumSize(980, 640)
         self.resize(1280, 840)
 
         self.settings = load_settings()
+        self._show_request_path = os.path.join(get_app_data_dir(), "show-window.request")
+        self._last_show_request_mtime = self._read_show_request_mtime()
         self._gpu_options = self._load_gpu_options()
         self._engine_output_queue: queue.Queue[str] = queue.Queue()
         self._engine_output_lines: list[str] = []
@@ -388,6 +434,7 @@ class MainWindow(QMainWindow):
         self._engine_ready_file = ""
         self._paused = False
         self._force_quitting = False
+        self._quit_shortcut: QShortcut | None = None
         self.process: subprocess.Popen | None = None
         self._mic_level_lock = threading.Lock()
         self._mic_level_db = -96.0
@@ -403,6 +450,7 @@ class MainWindow(QMainWindow):
         self._input_channel_count_cache: dict[str, tuple[float, int]] = {}
         self._active_mode_cache = "Voice"
         self._active_mode_cache_ts = 0.0
+        self._groq_stt_model_cache: tuple[float, list[dict[str, str]]] = (0.0, [])
         self._loading_preview_enabled = self._should_auto_start_engine()
         self._loading_preview_hotkeys: list = []
         self._loading_preview_locked = False
@@ -452,11 +500,18 @@ class MainWindow(QMainWindow):
 
         self.tray = TrayIcon(self)
         self.tray.show()
+        if sys.platform == "darwin":
+            self._quit_shortcut = QShortcut(QKeySequence.StandardKey.Quit, self)
+            self._quit_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            self._quit_shortcut.activated.connect(self.force_quit)
         QTimer.singleShot(0, self._enable_native_shadow)
 
         self.output_timer = QTimer(self)
         self.output_timer.timeout.connect(self._drain_engine_output)
-        self.output_timer.start(150)
+        self.output_timer.start(40)
+        self.show_request_timer = QTimer(self)
+        self.show_request_timer.timeout.connect(self._check_show_window_request)
+        self.show_request_timer.start(250)
         self.engine_start_timer = QTimer(self)
         self.engine_start_timer.setSingleShot(True)
         self.engine_start_timer.timeout.connect(self.start_engine)
@@ -507,12 +562,26 @@ class MainWindow(QMainWindow):
 
     def _log_web_ui(self, message: str):
         try:
-            log_root = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Whisperer", "logs")
+            log_root = os.path.join(get_app_data_dir(), "logs")
             os.makedirs(log_root, exist_ok=True)
             with open(os.path.join(log_root, "web-ui.log"), "a", encoding="utf-8") as log_file:
                 log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
         except Exception:
             pass
+
+    def _read_show_request_mtime(self) -> float:
+        try:
+            return os.path.getmtime(self._show_request_path)
+        except OSError:
+            return 0.0
+
+    def _check_show_window_request(self):
+        mtime = self._read_show_request_mtime()
+        if mtime <= self._last_show_request_mtime:
+            return
+        self._last_show_request_mtime = mtime
+        self._log_web_ui("External launch requested UI window")
+        self.show_window()
 
     def _should_auto_start_engine(self) -> bool:
         startup = self.settings.get("startup", {})
@@ -527,29 +596,21 @@ class MainWindow(QMainWindow):
         ]
 
     def _loading_preview_hotkey_is_pressed(self) -> bool:
-        try:
-            import keyboard
-        except Exception:
-            return False
         for hotkey in self._loading_preview_hotkey_values():
             normalized = _normalize_keyboard_hotkey(hotkey)
             if not normalized:
                 continue
             try:
-                if keyboard.is_pressed(normalized):
+                if hotkeys.is_pressed(normalized):
                     return True
             except Exception:
                 continue
         return False
 
     def _loading_preview_alt_is_pressed(self) -> bool:
-        try:
-            import keyboard
-        except Exception:
-            return False
         for key in ("alt", "left alt", "right alt", "menu"):
             try:
-                if keyboard.is_pressed(key):
+                if hotkeys.is_pressed(key):
                     return True
             except Exception:
                 continue
@@ -562,10 +623,6 @@ class MainWindow(QMainWindow):
         self._unregister_loading_preview_shortcuts()
         if not self._loading_preview_enabled or self._engine_state == "running":
             return
-        try:
-            import keyboard
-        except Exception:
-            return
 
         seen: set[str] = set()
         for hotkey in self._loading_preview_hotkey_values():
@@ -574,7 +631,7 @@ class MainWindow(QMainWindow):
                 continue
             seen.add(normalized)
             try:
-                handle = keyboard.add_hotkey(normalized, self._request_loading_preview, suppress=False)
+                handle = hotkeys.add_hotkey(normalized, self._request_loading_preview, suppress=False)
                 self._loading_preview_hotkeys.append(handle)
             except Exception:
                 pass
@@ -582,14 +639,9 @@ class MainWindow(QMainWindow):
     def _unregister_loading_preview_shortcuts(self):
         if not self._loading_preview_hotkeys:
             return
-        try:
-            import keyboard
-        except Exception:
-            self._loading_preview_hotkeys.clear()
-            return
         for handle in self._loading_preview_hotkeys:
             try:
-                keyboard.remove_hotkey(handle)
+                hotkeys.remove_hotkey(handle)
             except Exception:
                 pass
         self._loading_preview_hotkeys.clear()
@@ -670,7 +722,10 @@ class MainWindow(QMainWindow):
                     pass
                 self._engine_ready_file = ""
             self._loading_preview_enabled = False
-            self._finish_loading_preview()
+            if self._loading_preview_overlay.isVisible() and self._loading_preview_hotkey_is_pressed():
+                self._loading_preview_overlay.hide_now()
+            else:
+                self._finish_loading_preview()
             self._unregister_loading_preview_shortcuts()
         elif state == "loading":
             self._loading_preview_enabled = True
@@ -697,22 +752,30 @@ class MainWindow(QMainWindow):
         self.settings.setdefault("startup", {})["launch_on_login"] = self._launch_on_login_enabled()
         microphones = self._load_microphone_options()
         selected_microphone = self._selected_microphone_value(microphones)
+        active_mode = self._dashboard_active_mode()
+        active_provider = (getattr(active_mode, "stt_provider", None) or "local").strip() or "local"
+        model_options = self._model_options_for_provider(active_provider)
         snapshot = {
             "version": config.VERSION,
             "engineState": self._engine_state,
             "settings": self.settings,
-            "models": MODEL_OPTIONS,
-            "gpus": [{"value": value, "label": label} for label, value in self._gpu_options],
+            "models": model_options,
+            "gpus": self._runtime_options(),
             "microphones": microphones,
             "inputChannels": self._load_input_channel_options(selected_microphone),
-            "selectedModel": self._current_model_value(),
-            "selectedGpu": str(self.settings.get("startup", {}).get("gpu_device", GPU_AUTO_VALUE)),
+            "selectedModel": self._selected_model_for_provider(active_provider, active_mode, model_options),
+            "selectedGpu": (
+                GROQ_RUNTIME_VALUE
+                if active_provider == "groq_whisper"
+                else str(self.settings.get("startup", {}).get("gpu_device", GPU_AUTO_VALUE))
+            ),
             "selectedMicrophone": selected_microphone,
             "selectedInputChannel": str(self.settings.get("audio", {}).get("input_channel", 0) or 0),
             "activeMode": self._active_mode_name(),
             "shortcuts": self._shortcut_payload(),
             "micLevel": self._mic_level_payload(),
             "dictationBackup": self._dictation_backup_payload(),
+            "apiKeys": self._api_key_payload(),
         }
         return json.dumps(snapshot, separators=(",", ":"))
 
@@ -733,6 +796,19 @@ class MainWindow(QMainWindow):
         snapshot = self.snapshot_json()
         self.bridge.settingsChanged.emit(snapshot)
         return snapshot
+
+    def _emit_key_snapshot(self) -> str:
+        snapshot = self.snapshot_json()
+        self.bridge.settingsChanged.emit(snapshot)
+        return snapshot
+
+    def _api_key_payload(self) -> dict[str, bool]:
+        try:
+            from core.secrets import get_key
+
+            return {service: bool(get_key(service)) for service in API_KEY_SERVICES}
+        except Exception:
+            return {service: False for service in API_KEY_SERVICES}
 
     def _dictation_backup_payload(self) -> dict[str, Any]:
         try:
@@ -921,10 +997,115 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
             raise RuntimeError(tail)
         raise RuntimeError("Backup transcription finished without returning text.")
 
+    def _dashboard_active_mode(self):
+        try:
+            from core.modes import get_mode_by_name
+
+            return get_mode_by_name(self._active_mode_cache) or get_mode_by_name("Voice")
+        except Exception:
+            return None
+
+    def _runtime_options(self) -> list[dict[str, Any]]:
+        options = [{"value": value, "label": label} for label, value in self._gpu_options]
+        options.append({"value": "__cloud_runtime_divider__", "label": "", "divider": True})
+        options.append({"value": GROQ_RUNTIME_VALUE, "label": "Groq API", "hint": "Cloud"})
+        return options
+
+    def _groq_stt_fallback_options(self) -> list[dict[str, str]]:
+        return [
+            {
+                "value": model_id,
+                "label": f"{meta['label']} - {meta['price']}",
+                "hint": meta["hint"],
+            }
+            for model_id, meta in GROQ_STT_MODEL_META.items()
+        ]
+
+    def _load_groq_stt_model_options(self) -> list[dict[str, str]]:
+        cached_at, cached_options = self._groq_stt_model_cache
+        if cached_options and time.monotonic() - cached_at < 300:
+            return cached_options
+
+        fallback = self._groq_stt_fallback_options()
+        try:
+            from core.secrets import get_key
+
+            key = get_key("groq")
+        except Exception:
+            key = None
+        if not key:
+            return fallback
+
+        try:
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/models",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "User-Agent": "Whisperer/5.5.2",
+                    "Accept": "application/json",
+                },
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            available = {
+                str(item.get("id") or "")
+                for item in payload.get("data", [])
+                if isinstance(item, dict) and item.get("active", True)
+            }
+            options = [
+                option
+                for option in fallback
+                if option["value"] in available
+            ]
+            if options:
+                self._groq_stt_model_cache = (time.monotonic(), options)
+                return options
+        except Exception:
+            pass
+        return cached_options or fallback
+
+    def _model_options_for_provider(self, provider: str) -> list[dict[str, str]]:
+        if provider == "groq_whisper":
+            return self._load_groq_stt_model_options()
+        return _available_model_options()
+
+    def _selected_model_for_provider(self, provider: str, active_mode, options: list[dict[str, str]]) -> str:
+        valid_values = {item["value"] for item in options}
+        if provider == "groq_whisper":
+            value = (getattr(active_mode, "stt_model", None) or "whisper-large-v3-turbo").strip()
+            return value if value in valid_values else "whisper-large-v3-turbo"
+        return self._current_model_value()
+
+    def _update_dashboard_active_stt(self, provider: str, model: str | None = None) -> bool:
+        try:
+            from core.modes import get_mode_by_name, update_mode
+
+            mode = get_mode_by_name(self._active_mode_cache) or get_mode_by_name("Voice")
+            if not mode or mode.id is None:
+                return False
+            update_mode(int(mode.id), stt_provider=provider, stt_model=model or "")
+            return True
+        except Exception:
+            return False
+
     def set_model(self, value: str) -> str:
-        valid_values = {item["value"] for item in MODEL_OPTIONS}
+        active_mode = self._dashboard_active_mode()
+        provider = (getattr(active_mode, "stt_provider", None) or "local").strip() or "local"
+        if provider == "groq_whisper":
+            options = self._load_groq_stt_model_options()
+            valid_values = {item["value"] for item in options}
+            if value not in valid_values:
+                value = "whisper-large-v3-turbo"
+            self._update_dashboard_active_stt("groq_whisper", value)
+            snapshot = self.snapshot_json()
+            self.bridge.settingsChanged.emit(snapshot)
+            return snapshot
+
+        options = _available_model_options()
+        valid_values = {item["value"] for item in options}
         if value not in valid_values:
-            value = MODEL_OPTIONS[0]["value"]
+            value = options[0]["value"]
         self.settings.setdefault("startup", {})["default_model"] = value
         snapshot = self._save_and_emit()
         if self.process and self.process.poll() is None:
@@ -932,9 +1113,21 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         return snapshot
 
     def set_gpu(self, value: str) -> str:
+        if value == GROQ_RUNTIME_VALUE:
+            active_mode = self._dashboard_active_mode()
+            current_model = (getattr(active_mode, "stt_model", None) or "").strip()
+            valid_groq_models = {item["value"] for item in self._load_groq_stt_model_options()}
+            if current_model not in valid_groq_models:
+                current_model = "whisper-large-v3-turbo"
+            self._update_dashboard_active_stt("groq_whisper", current_model)
+            snapshot = self.snapshot_json()
+            self.bridge.settingsChanged.emit(snapshot)
+            return snapshot
+
         valid_values = {gpu_value for _label, gpu_value in self._gpu_options}
         if value not in valid_values:
             value = GPU_AUTO_VALUE
+        self._update_dashboard_active_stt("local", "")
         self.settings.setdefault("startup", {})["gpu_device"] = value
         snapshot = self._save_and_emit()
         if self.process and self.process.poll() is None:
@@ -988,6 +1181,8 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 value = max(0, min(100, int(round(int(value) / 25)) * 25))
             except (TypeError, ValueError):
                 value = 75
+        if section == "audio" and key == "ducking_enabled":
+            value = bool(value)
         self.settings.setdefault(section, {})[key] = value
         snapshot = self._save_and_emit()
         if section == "performance" and key == "engine_preload" and value == "off":
@@ -999,9 +1194,91 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 self.start_engine()
         return snapshot
 
+    def set_api_key(self, service: str, value: str) -> str:
+        service = (service or "").strip()
+        if service not in API_KEY_SERVICES:
+            return self.snapshot_json()
+        value = (value or "").strip()
+        try:
+            from core.secrets import delete_key, set_key
+
+            if value:
+                set_key(service, value)
+            else:
+                delete_key(service)
+        except Exception:
+            pass
+        return self._emit_key_snapshot()
+
+    def delete_api_key(self, service: str) -> str:
+        service = (service or "").strip()
+        if service not in API_KEY_SERVICES:
+            return self.snapshot_json()
+        try:
+            from core.secrets import delete_key
+
+            delete_key(service)
+        except Exception:
+            pass
+        return self._emit_key_snapshot()
+
+    def _test_api_key_result(self, service: str) -> dict[str, Any]:
+        service = (service or "").strip()
+        label = API_KEY_SERVICES.get(service, service or "Provider")
+        if service not in API_KEY_SERVICES:
+            return {"service": service, "ok": False, "message": "Unknown provider."}
+
+        try:
+            from core.secrets import get_key
+
+            key = get_key(service)
+        except Exception:
+            key = None
+        if not key:
+            return {"service": service, "ok": False, "message": f"No {label} key is saved yet."}
+
+        checks = {
+            "groq": (
+                "https://api.groq.com/openai/v1/models",
+                {
+                    "Authorization": f"Bearer {key}",
+                    "User-Agent": "Whisperer/5.5.2",
+                    "Accept": "application/json",
+                },
+            ),
+            "openai": ("https://api.openai.com/v1/models", {"Authorization": f"Bearer {key}"}),
+            "deepgram": ("https://api.deepgram.com/v1/projects", {"Authorization": f"Token {key}"}),
+        }
+        check = checks.get(service)
+        if check is None:
+            return {"service": service, "ok": False, "message": f"{label} does not have a built-in key test yet."}
+
+        url, headers = check
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if 200 <= int(getattr(resp, "status", 200)) < 300:
+                    return {"service": service, "ok": True, "message": f"{label} key is working."}
+        except urllib.error.HTTPError as exc:
+            return {
+                "service": service,
+                "ok": False,
+                "message": f"{label} rejected the key ({exc.code}).",
+            }
+        except Exception as exc:
+            return {"service": service, "ok": False, "message": f"Could not reach {label}: {exc}"}
+        return {"service": service, "ok": False, "message": f"{label} returned an unexpected response."}
+
+    def test_api_key(self, service: str) -> str:
+        payload = {
+            "apiKeyTest": self._test_api_key_result(service),
+            "apiKeys": self._api_key_payload(),
+        }
+        return json.dumps(payload, separators=(",", ":"))
+
     def set_shortcut(self, name: str, value: str) -> str:
         name = (name or "").strip()
-        value = (value or "").strip().lower()
+        value = _normalize_keyboard_hotkey((value or "").strip().lower()) or ""
         if not name:
             return self.snapshot_json()
         self.settings = load_settings()
@@ -1023,11 +1300,14 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
             return bool(self.settings.get("startup", {}).get("launch_on_login", False))
 
     def _current_model_value(self) -> str:
-        value = self.settings.get("startup", {}).get("default_model", MODEL_OPTIONS[0]["value"])
-        valid_values = {item["value"] for item in MODEL_OPTIONS}
-        return value if value in valid_values else MODEL_OPTIONS[0]["value"]
+        options = _available_model_options()
+        value = self.settings.get("startup", {}).get("default_model", options[0]["value"])
+        valid_values = {item["value"] for item in options}
+        return value if value in valid_values else options[0]["value"]
 
     def _load_gpu_options(self) -> list[tuple[str, str]]:
+        if sys.platform == "darwin":
+            return [("Auto (Apple Silicon / CPU)", GPU_AUTO_VALUE)]
         options = [("Auto (primary CUDA GPU)", GPU_AUTO_VALUE)]
         try:
             creationflags = 0x08000000 if os.name == "nt" else 0
@@ -1150,17 +1430,20 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         if not hotkey:
             return []
         labels: list[str] = []
-        for part in str(hotkey).split("+"):
+        normalized = _normalize_keyboard_hotkey(hotkey) or ""
+        for part in normalized.split("+"):
             key = part.strip()
             lookup = {
                 "ctrl": "Ctrl",
                 "control": "Ctrl",
                 "alt": "Alt",
+                "option": "Option",
                 "shift": "Shift",
-                "left windows": "Left Windows",
-                "right windows": "Right Windows",
-                "windows": "Windows",
-                "win": "Windows",
+                "cmd": "Cmd" if sys.platform == "darwin" else "Windows",
+                "left windows": "Cmd" if sys.platform == "darwin" else "Left Windows",
+                "right windows": "Cmd" if sys.platform == "darwin" else "Right Windows",
+                "windows": "Cmd" if sys.platform == "darwin" else "Windows",
+                "win": "Cmd" if sys.platform == "darwin" else "Windows",
                 "escape": "Esc",
             }
             labels.append(lookup.get(key.lower(), key[:1].upper() + key[1:]))
@@ -1523,6 +1806,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
     def start_engine(self):
         if self.process and self.process.poll() is None:
             return
+        self._terminate_orphan_engine_processes()
         self.settings = load_settings()
         self._loading_preview_enabled = True
         self._register_loading_preview_shortcuts()
@@ -1532,28 +1816,38 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         model_arg = self._current_model_value()
 
         if getattr(sys, "frozen", False):
-            source_root = self._frozen_engine_source_root()
-            python_exe = self._external_engine_python()
-            if source_root and python_exe:
-                command = [python_exe, "-u", os.path.join(source_root, "main.py"), f"--model={model_arg}"]
-                cwd = source_root
-                env = os.environ.copy()
-                env["PYTHONPATH"] = source_root + os.pathsep + env.get("PYTHONPATH", "")
-                env.setdefault("WHISPERER_PROJECT_ROOT", source_root)
-            else:
+            if sys.platform == "darwin":
                 command = [sys.executable, "--engine", f"--model={model_arg}"]
                 cwd = project_root
                 env = os.environ.copy()
+            else:
+                source_root = self._frozen_engine_source_root()
+                python_exe = self._external_engine_python()
+                if source_root and python_exe:
+                    command = [python_exe, "-u", os.path.join(source_root, "main.py"), f"--model={model_arg}"]
+                    cwd = source_root
+                    env = os.environ.copy()
+                    env["PYTHONPATH"] = source_root + os.pathsep + env.get("PYTHONPATH", "")
+                    env.setdefault("WHISPERER_PROJECT_ROOT", source_root)
+                else:
+                    command = [sys.executable, "--engine", f"--model={model_arg}"]
+                    cwd = project_root
+                    env = os.environ.copy()
         else:
             command = [sys.executable, "-u", os.path.join(project_root, "main.py"), f"--model={model_arg}"]
             cwd = project_root
             env = os.environ.copy()
 
+        self._log_web_ui(f"Starting engine: {' '.join(command)}")
         env["WHISPERER_UI_LOADING_PREVIEW"] = "1"
+        env["WHISPERER_ENGINE_PARENT_UI"] = "1"
+        if sys.platform == "darwin":
+            env["WHISPERER_ENGINE_ACCESSORY"] = "1"
+            env["QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM"] = "1"
         _apply_quiet_model_env(env)
         self._apply_engine_gpu_env(env)
         try:
-            log_root = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Whisperer", "logs")
+            log_root = os.path.join(get_app_data_dir(), "logs")
             os.makedirs(log_root, exist_ok=True)
             self._engine_ready_file = os.path.join(log_root, f"engine-ready-{time.time_ns()}.json")
             if os.path.exists(self._engine_ready_file):
@@ -1601,7 +1895,12 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
         self.process = None
+        self._terminate_orphan_engine_processes()
         if self._engine_ready_file:
             try:
                 os.remove(self._engine_ready_file)
@@ -1609,6 +1908,55 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 pass
             self._engine_ready_file = ""
         self._set_engine_state("stopped")
+
+    def _terminate_orphan_engine_processes(self):
+        if sys.platform != "darwin":
+            return
+        app_exe = os.path.abspath(sys.executable)
+        if not app_exe.endswith("/Contents/MacOS/Whisperer"):
+            return
+        current_pid = os.getpid()
+        try:
+            output = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
+        except Exception:
+            return
+        pids: list[int] = []
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            pid_text, _, command = line.partition(" ")
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            if pid == current_pid:
+                continue
+            if app_exe in command and " --engine" in command:
+                pids.append(pid)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                continue
+        deadline = time.monotonic() + 2.0
+        while pids and time.monotonic() < deadline:
+            pids = [pid for pid in pids if self._process_exists(pid)]
+            if pids:
+                time.sleep(0.05)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _process_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
 
     def restart_engine(self):
         self.stop_engine()
@@ -1631,6 +1979,13 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        if sys.platform == "darwin":
+            try:
+                from AppKit import NSApplication
+
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            except Exception:
+                pass
         QTimer.singleShot(0, self._enable_native_shadow)
         QTimer.singleShot(0, self._apply_taskbar_identity)
 
@@ -1743,13 +2098,16 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         except Exception:
             pass
 
-    def force_quit(self):
+    def prepare_for_quit(self):
         self._force_quitting = True
         try:
             self.tray.hide()
         except Exception:
             pass
         self.stop_engine()
+
+    def force_quit(self):
+        self.prepare_for_quit()
         self.close()
         app = QApplication.instance()
         if app:
@@ -1770,7 +2128,11 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
     def _external_engine_python(self) -> str | None:
         candidates = [
             os.environ.get("WHISPERER_PYTHON"),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", "Python310", "python.exe"),
+            sys.executable if not getattr(sys, "frozen", False) else "",
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", "Python310", "python.exe")
+            if os.name == "nt"
+            else "",
+            shutil.which("python3"),
             shutil.which("python"),
         ]
         for candidate in candidates:
@@ -1830,11 +2192,20 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
             if line.startswith("BACKUP_TRANSCRIPTION_RESULT "):
                 self._handle_backup_transcription_engine_result(line)
                 continue
+            if line == "OPEN_UI_REQUESTED":
+                self._log_web_ui("Engine requested UI window")
+                self.show_window()
+                continue
+            if line == "STOP_ENGINE_REQUESTED":
+                self._log_web_ui("Engine requested stop")
+                QTimer.singleShot(0, self.stop_engine)
+                return
             if self._is_noisy_engine_line(line):
                 continue
             changed = True
             self._engine_output_lines.append(line)
             self._engine_output_lines = self._engine_output_lines[-200:]
+            self._log_web_ui(f"Engine output: {line}")
             print(f"[engine] {line}", flush=True)
             if line == "ENGINE_READY":
                 self._set_engine_state("running")
@@ -1844,13 +2215,14 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 self._loading_preview_locked = False
                 if self._loading_preview_overlay.isVisible():
                     self._loading_preview_overlay.set_locked(False)
-                    self._loading_preview_overlay.fade_out()
+                    self._loading_preview_overlay.hide_now()
 
         if self._check_engine_ready_file():
             changed = True
 
         if self.process and self.process.poll() is not None:
             return_code = self.process.returncode
+            self._log_web_ui(f"Engine exited with code {return_code}")
             self.process = None
             self._set_engine_state("stopped")
             if self._backup_transcription_busy and self._backup_transcription_source == "engine":

@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 import sys
 
-APP_USER_MODEL_ID = "Whisperer.Windows"
-APP_ICON_FILENAME = "whisperer.ico"
+APP_USER_MODEL_ID = "Whisperer.Mac" if sys.platform == "darwin" else "Whisperer.Windows"
+APP_ICON_FILENAME = "whisperer.icns" if sys.platform == "darwin" else "whisperer.ico"
 
 
 def app_icon_path() -> str:

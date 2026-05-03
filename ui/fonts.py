@@ -1,4 +1,4 @@
-"""Font helpers tuned for smooth Windows UI text."""
+"""Font helpers tuned for smooth native UI text."""
 
 from PyQt6.QtGui import QFont, QFontDatabase
 
@@ -19,7 +19,7 @@ def san_francisco_family() -> str:
     for family in SAN_FRANCISCO_FAMILIES:
         if family in installed:
             return family
-    return "Segoe UI"
+    return "Arial"
 
 
 def san_francisco(size: int = 10, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:

@@ -23,7 +23,7 @@ export interface Tweaks {
   wallpaper: Wallpaper;
 }
 
-export type BridgeOption = { value: string; label: string; hint?: string };
+export type BridgeOption = { value: string; label: string; hint?: string; divider?: boolean; disabled?: boolean };
 export type AppSettings = Record<string, any>;
 export type MicLevel = { db: number; level: number; error?: string };
 export type DictationBackup = {
@@ -110,6 +110,7 @@ export interface AppSnapshot {
   shortcuts?: Record<string, string[]>;
   micLevel?: MicLevel;
   dictationBackup?: DictationBackup;
+  apiKeys?: Record<string, boolean>;
   vocabulary?: VocabularySnapshot;
   history?: HistorySnapshot;
   modesData?: ModeItem[];
@@ -124,12 +125,11 @@ const DEFAULT_TWEAKS: Tweaks = {
 };
 
 const DEFAULT_MODELS: BridgeOption[] = [
-  { value: "nvidia/parakeet-unified-en-0.6b", label: "NVIDIA Parakeet Unified 0.6B" },
   { value: "deepdml/faster-whisper-large-v3-turbo-ct2", label: "Whisper v3 Turbo" },
   { value: "large-v3", label: "Whisper Large v3" },
 ];
 
-const DEFAULT_GPUS: BridgeOption[] = [{ value: "auto", label: "Auto (primary CUDA GPU)" }];
+const DEFAULT_GPUS: BridgeOption[] = [{ value: "auto", label: "Auto (Apple Silicon / CPU)" }];
 const DEFAULT_MICROPHONES: MicOption[] = [{ value: "default", label: "System default microphone", hint: "Auto" }];
 const DEFAULT_CHANNELS: BridgeOption[] = [{ value: "0", label: "Channel 1" }];
 const DEFAULT_MIC_LEVEL: MicLevel = { db: -96, level: 0 };
@@ -259,9 +259,10 @@ export default function App() {
   const [gpu, setGpuState] = useState("auto");
   const [mic, setMicState] = useState("default");
   const [inputChannel, setInputChannelState] = useState("0");
-  const [shortcuts, setShortcuts] = useState<Record<string, string[]>>({ dictation: ["Ctrl", "Left Windows"] });
+  const [shortcuts, setShortcuts] = useState<Record<string, string[]>>({ dictation: ["Ctrl", "Cmd"] });
   const [micLevel, setMicLevel] = useState<MicLevel>(DEFAULT_MIC_LEVEL);
   const [dictationBackup, setDictationBackup] = useState<DictationBackup>(DEFAULT_DICTATION_BACKUP);
+  const [apiKeys, setApiKeys] = useState<Record<string, boolean>>({});
   const [vocabulary, setVocabulary] = useState<VocabularySnapshot>(DEFAULT_VOCABULARY);
   const [history, setHistory] = useState<HistorySnapshot>(DEFAULT_HISTORY);
   const [modesData, setModesData] = useState<ModeItem[]>(DEFAULT_MODES);
@@ -296,6 +297,7 @@ export default function App() {
     if (snapshot.shortcuts) setShortcuts(snapshot.shortcuts);
     if (snapshot.micLevel) setMicLevel(snapshot.micLevel);
     if (snapshot.dictationBackup) setDictationBackup(snapshot.dictationBackup);
+    if (snapshot.apiKeys) setApiKeys(snapshot.apiKeys);
     if (snapshot.vocabulary) setVocabulary(snapshot.vocabulary);
     if (snapshot.history) setHistory(snapshot.history);
     if (snapshot.modesData) setModesData(snapshot.modesData);
@@ -424,13 +426,21 @@ export default function App() {
     window.whisperer?.setShortcut?.(name, value).then(applySnapshot).catch(() => {});
   }, [applySnapshot]);
 
+  const setApiKey = useCallback((service: string, value: string) => {
+    window.whisperer?.setApiKey?.(service, value).then(applySnapshot).catch(() => {});
+  }, [applySnapshot]);
+
+  const deleteApiKey = useCallback((service: string) => {
+    window.whisperer?.deleteApiKey?.(service).then(applySnapshot).catch(() => {});
+  }, [applySnapshot]);
+
   const transcribeLastDictation = useCallback(() => {
     window.whisperer?.transcribeLastDictation?.().then(applySnapshot).catch(() => {});
   }, [applySnapshot]);
 
   const pageTitle = NAV_ITEMS.find((n) => n.key === activePage)?.label || "";
   const densityScale = tweaks.density === "compact" ? 0.96 : 1;
-  const dictationKeys = shortcuts.dictation?.length ? shortcuts.dictation : ["Ctrl", "Left Windows"];
+  const dictationKeys = shortcuts.dictation?.length ? shortcuts.dictation : ["Ctrl", "Cmd"];
   const versionShort = useMemo(() => version.replace(/^v/i, ""), [version]);
 
   const startWindowDrag = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -504,8 +514,11 @@ export default function App() {
                 setTweaks={setTweaks}
                 settings={settings}
                 shortcuts={shortcuts}
+                apiKeys={apiKeys}
                 setSetting={setSetting}
                 setShortcut={setShortcut}
+                setApiKey={setApiKey}
+                deleteApiKey={deleteApiKey}
               />
             )}
             {activePage === "sound" && (

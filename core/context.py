@@ -1,9 +1,14 @@
 """
-Context extraction: OCR, selected text, clipboard, and UI Automation.
+Context extraction: OCR, selected text, clipboard, and focused-control text.
 """
+
+from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+import os
+import shutil
+import sys
 import threading
 import time
 
@@ -12,12 +17,17 @@ import numpy as np
 from PIL import Image
 
 import config
+from core import hotkeys
+from core import native
 from core.term_filter import extract_useful_terms
 
 try:
     import pytesseract
 
-    pytesseract.pytesseract.tesseract_cmd = config.TESSERACT_CMD
+    tesseract_cmd = config.TESSERACT_CMD
+    if not os.path.exists(tesseract_cmd):
+        tesseract_cmd = shutil.which("tesseract") or tesseract_cmd
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
     _TESSERACT_AVAILABLE = True
 except Exception:
     _TESSERACT_AVAILABLE = False
@@ -34,6 +44,10 @@ _ocr_cache: dict[str, object] = {
 
 def _get_active_window_rect() -> tuple[int, int, int, int] | None:
     """Return (left, top, right, bottom) of the foreground window, or None."""
+    if sys.platform == "darwin":
+        return native.active_window_rect()
+    if os.name != "nt":
+        return None
     user32 = ctypes.windll.user32
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
@@ -46,6 +60,10 @@ def _get_active_window_rect() -> tuple[int, int, int, int] | None:
 
 def _get_active_process_name() -> str:
     """Return the lowercase exe name of the foreground window's process."""
+    if sys.platform == "darwin":
+        return native.active_window_name()
+    if os.name != "nt":
+        return ""
     import win32gui
     import win32process
     import psutil
@@ -70,6 +88,8 @@ def get_active_window_name() -> str:
 
 def get_active_window_title() -> str:
     """Return the title of the currently active foreground window."""
+    if sys.platform == "darwin":
+        return native.active_window_title()
     try:
         import win32gui
 
@@ -83,6 +103,8 @@ def get_active_window_title() -> str:
 
 def _capture_screen_context_uncached(rect: tuple[int, int, int, int]) -> str:
     if not config.OCR_ENABLED or not _TESSERACT_AVAILABLE:
+        return ""
+    if sys.platform == "darwin" and not native.screen_capture_access_granted():
         return ""
 
     left, top, right, bottom = rect
@@ -120,6 +142,8 @@ def capture_screen_context() -> str:
     Take a screenshot of the active window, run OCR, and return the
     extracted text as a single string of unique words.
     """
+    if sys.platform == "darwin" and not native.screen_capture_access_granted():
+        return ""
     rect = _get_active_window_rect()
     if rect is None:
         return ""
@@ -132,6 +156,8 @@ def capture_screen_context() -> str:
 
 def capture_screen_context_cached(blocking: bool = False) -> str:
     """Return cached OCR immediately and refresh in the background when stale."""
+    if sys.platform == "darwin" and not native.screen_capture_access_granted():
+        return ""
     rect = _get_active_window_rect()
     if rect is None:
         return ""
@@ -170,7 +196,7 @@ def capture_screen_context_cached(blocking: bool = False) -> str:
 # Selected text via clipboard
 # ---------------------------------------------------------------------------
 
-_CLIPBOARD_RESTORE_TIMEOUT = threading.Timer | None
+_CLIPBOARD_RESTORE_TIMEOUT = None
 
 
 def capture_selected_text() -> str:
@@ -180,7 +206,6 @@ def capture_selected_text() -> str:
     """
     try:
         import pyperclip
-        import keyboard
     except Exception:
         return ""
 
@@ -191,7 +216,7 @@ def capture_selected_text() -> str:
         pass
 
     try:
-        keyboard.send("ctrl+c")
+        hotkeys.send("cmd+c" if sys.platform == "darwin" else "ctrl+c")
     except Exception:
         return ""
 
@@ -249,11 +274,15 @@ def mark_clipboard_pasted():
 
 
 # ---------------------------------------------------------------------------
-# UI Automation text for focused control
+# Focused-control text
 # ---------------------------------------------------------------------------
 
 def capture_ui_automation_text(hwnd: int | None = None) -> str:
-    """Use Windows UI Automation to pull focused-control text. Falls back to ''."""
+    """Pull focused-control text where the platform exposes it. Falls back to ''."""
+    if sys.platform == "darwin":
+        return native.focused_control_text()
+    if os.name != "nt":
+        return ""
     try:
         import comtypes.client
         UIAutomation = comtypes.client.CreateObject("UIAutomationClient.CUIAutomation")

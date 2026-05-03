@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 
 
-def _check_cuda() -> dict:
+def _check_acceleration() -> dict:
+    if sys.platform == "darwin":
+        try:
+            import torch
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                return {"name": "Acceleration", "ok": True, "message": "Apple Metal (MPS) available"}
+            return {"name": "Acceleration", "ok": True, "message": "CPU mode"}
+        except Exception as exc:
+            return {"name": "Acceleration", "ok": True, "message": f"CPU mode ({exc})"}
     try:
         import torch
         available = torch.cuda.is_available()
         name = torch.cuda.get_device_name(0) if available else "None"
-        return {"name": "CUDA / GPU", "ok": available, "message": name}
+        return {"name": "Acceleration", "ok": available, "message": name}
     except Exception as exc:
         try:
             result = subprocess.run(
@@ -23,10 +32,10 @@ def _check_cuda() -> dict:
             if result.returncode == 0 and result.stdout.strip():
                 first = result.stdout.strip().splitlines()[0]
                 count = len(result.stdout.strip().splitlines())
-                return {"name": "CUDA / GPU", "ok": True, "message": f"{count} GPU(s): {first}"}
+                return {"name": "Acceleration", "ok": True, "message": f"{count} GPU(s): {first}"}
         except Exception:
             pass
-        return {"name": "CUDA / GPU", "ok": False, "message": str(exc)}
+        return {"name": "Acceleration", "ok": False, "message": str(exc)}
 
 
 def _check_microphone() -> dict:
@@ -90,7 +99,7 @@ def _check_file_transcription() -> dict:
 
 def run_diagnostics() -> list[dict]:
     return [
-        _check_cuda(),
+        _check_acceleration(),
         _check_microphone(),
         _check_ocr(),
         _check_ffmpeg(),

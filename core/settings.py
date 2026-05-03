@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
 
 from core.paths import get_app_data_dir
+
+IS_MAC = sys.platform == "darwin"
+DEFAULT_LOCAL_MODEL = "deepdml/faster-whisper-large-v3-turbo-ct2" if IS_MAC else "nvidia/parakeet-unified-en-0.6b"
+DEFAULT_DICTATION_HOTKEY = "ctrl+cmd" if IS_MAC else "ctrl+left windows"
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -14,7 +19,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "startup": {
         "auto_start_engine": True,
         "launch_on_login": False,
-        "default_model": "nvidia/parakeet-unified-en-0.6b",
+        "default_model": DEFAULT_LOCAL_MODEL,
         "gpu_device": "auto",
     },
     "dictation": {
@@ -52,6 +57,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "overlay": {
         "position": None,
+        "opacity": 0.85,
+        "blur_radius": 7,
     },
     "recording_window": {
         "style": "mini",
@@ -70,8 +77,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "ollama_url": "http://localhost:11434",
         "openai_compat_url": "http://localhost:8000",
     },
+    "stt": {
+        "openai_compat_url": "http://localhost:8000/v1/audio/transcriptions",
+        "nvidia_nim_url": "http://localhost:9000/v1/audio/transcriptions",
+    },
     "shortcuts": {
-        "dictation": "ctrl+left windows",
+        "dictation": DEFAULT_DICTATION_HOTKEY,
         "toggle_recording": None,
         "cancel": "escape",
         "mode_next": "ctrl+alt+right",

@@ -100,6 +100,44 @@ def _migration_003_deleted_builtin_modes(cursor: sqlite3.Cursor):
 MIGRATIONS.append(_migration_003_deleted_builtin_modes)
 
 
+def _migration_004_fast_cloud_defaults(cursor: sqlite3.Cursor):
+    cursor.execute("""
+        INSERT INTO modes
+            (name, is_builtin, description, stt_provider, stt_model,
+             formatting_prompt, output_format, enabled)
+        VALUES
+            (
+                'Fast Cloud',
+                1,
+                'Groq Whisper Large v3 Turbo for low-latency dictation.',
+                'groq_whisper',
+                'whisper-large-v3-turbo',
+                '',
+                'plain',
+                1
+            )
+        ON CONFLICT(name) DO NOTHING
+    """)
+    cursor.execute("""
+        UPDATE modes
+        SET
+            description = CASE
+                WHEN description = 'Raw transcription with minimal formatting.'
+                THEN 'Fast raw transcription with minimal formatting.'
+                ELSE description
+            END,
+            stt_provider = 'groq_whisper',
+            stt_model = 'whisper-large-v3-turbo'
+        WHERE
+            name = 'Voice'
+            AND is_builtin = 1
+            AND (stt_provider IS NULL OR stt_provider = '')
+    """)
+
+
+MIGRATIONS.append(_migration_004_fast_cloud_defaults)
+
+
 def ensure_migrated():
     """Run any pending migrations and update schema version."""
     path = database_path()

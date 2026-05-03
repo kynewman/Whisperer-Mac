@@ -59,7 +59,22 @@ class Mode:
 
 
 BUILTIN_MODES: list[dict] = [
-    {"name": "Voice", "description": "Raw transcription with minimal formatting.", "formatting_prompt": "", "output_format": "plain"},
+    {
+        "name": "Voice",
+        "description": "Fast raw transcription with minimal formatting.",
+        "stt_provider": "groq_whisper",
+        "stt_model": "whisper-large-v3-turbo",
+        "formatting_prompt": "",
+        "output_format": "plain",
+    },
+    {
+        "name": "Fast Cloud",
+        "description": "Groq Whisper Large v3 Turbo for low-latency dictation.",
+        "stt_provider": "groq_whisper",
+        "stt_model": "whisper-large-v3-turbo",
+        "formatting_prompt": "",
+        "output_format": "plain",
+    },
     {"name": "Message", "description": "Clean up dictated message for chat apps.", "formatting_prompt": "Clean up the following dictated message for sending in a chat app. Keep it conversational and concise.", "output_format": "plain"},
     {"name": "Email", "description": "Polished professional email body.", "formatting_prompt": "Rewrite the following dictated text as a polished professional email body. Preserve the meaning exactly.", "output_format": "plain"},
     {"name": "Note", "description": "Clear, well-punctuated prose.", "formatting_prompt": "Clean up the following dictated text into clear, well-punctuated prose.", "output_format": "plain"},
@@ -84,9 +99,17 @@ def seed_builtins():
         if cursor.fetchone() is None:
             cursor.execute("""
                 INSERT INTO modes
-                    (name, is_builtin, description, formatting_prompt, output_format, enabled)
-                VALUES (?, 1, ?, ?, ?, 1)
-            """, (data["name"], data["description"], data["formatting_prompt"], data["output_format"]))
+                    (name, is_builtin, description, stt_provider, stt_model,
+                     formatting_prompt, output_format, enabled)
+                VALUES (?, 1, ?, ?, ?, ?, ?, 1)
+            """, (
+                data["name"],
+                data["description"],
+                data.get("stt_provider"),
+                data.get("stt_model"),
+                data["formatting_prompt"],
+                data["output_format"],
+            ))
     conn.commit()
     conn.close()
 

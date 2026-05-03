@@ -30,7 +30,7 @@ export const NAV_ITEMS: NavItem[] = [
 ];
 
 export const SHORTCUTS: Shortcut[] = [
-  { key: "dictation", label: "Dictation hotkey", combo: ["Ctrl", "Left Windows"], hint: "Hold while speaking. Release to transcribe and paste." },
-  { key: "long_form", label: "Lock dictation", combo: ["Alt"], hint: "Keep the overlay open for long-form dictation." },
+  { key: "dictation", label: "Dictation hotkey", combo: ["Ctrl", "Cmd"], hint: "Hold while speaking. Release to transcribe and paste." },
+  { key: "long_form", label: "Lock dictation", combo: ["Option"], hint: "Keep the overlay open for long-form dictation." },
   { key: "cancel", label: "Cancel recording", combo: ["Escape"], hint: "Discard the current recording immediately." },
 ];

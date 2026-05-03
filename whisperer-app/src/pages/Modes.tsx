@@ -230,17 +230,17 @@ export default function ModesPage({
           <Row
             title="Speech-to-text provider"
             subtitle="The model family used before formatting."
-            control={<Select value={working.stt} onChange={(v) => edit({ stt: v })} options={[{ value: "local", label: "Local" }, { value: "openai_whisper", label: "OpenAI Whisper" }, { value: "groq_whisper", label: "Groq Whisper" }, { value: "deepgram", label: "Deepgram" }]} width={210} />}
+            control={<Select value={working.stt} onChange={(v) => edit({ stt: v })} options={[{ value: "local", label: "Local" }, { value: "groq_whisper", label: "Groq Fast Cloud" }, { value: "openai_whisper", label: "OpenAI Speech" }, { value: "deepgram", label: "Deepgram Nova" }, { value: "nvidia_nim_parakeet", label: "NVIDIA NIM Parakeet" }, { value: "openai_compatible_stt", label: "OpenAI-compatible STT" }]} width={240} />}
           />
           <Row title="STT model override" subtitle="Optional provider-specific model name."
-               control={<Input value={working.sttModel || ""} onChange={(v) => edit({ sttModel: v } as Partial<ModeItem>)} style={{ width: 260 }} />} />
+               control={<Input value={working.sttModel || ""} onChange={(v) => edit({ sttModel: v } as Partial<ModeItem>)} placeholder="provider default" style={{ width: 260 }} />} />
           <Row
             title="LLM post-processing"
             subtitle={working.llm ? "An LLM rewrites the raw transcript using the mode prompt." : "Off - paste the raw transcript after replacements."}
             control={<Toggle checked={working.llm} onChange={(v) => edit({ llm: v })} />}
           />
           <Row title="LLM provider" subtitle="Used only when LLM post-processing is enabled."
-               control={<Select value={working.llmProvider || "ollama"} onChange={(v) => edit({ llmProvider: v } as Partial<ModeItem>)} options={[{ value: "ollama", label: "Ollama" }, { value: "openai_compat", label: "OpenAI-compatible" }, { value: "openai", label: "OpenAI" }, { value: "anthropic", label: "Anthropic" }]} width={210} />} />
+               control={<Select value={working.llmProvider || "ollama"} onChange={(v) => edit({ llmProvider: v } as Partial<ModeItem>)} options={[{ value: "ollama", label: "Ollama" }, { value: "openai_compat", label: "OpenAI-compatible" }, { value: "openai", label: "OpenAI" }, { value: "anthropic", label: "Anthropic" }, { value: "groq", label: "Groq" }]} width={210} />} />
           <Row title="LLM model" subtitle="Optional model name for the selected provider."
                control={<Input value={working.llmModel || ""} onChange={(v) => edit({ llmModel: v } as Partial<ModeItem>)} style={{ width: 260 }} />} />
           <Row title="LLM prompt" subtitle="Detailed rewrite instructions for this mode."

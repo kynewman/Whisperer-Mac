@@ -147,6 +147,7 @@ export const TitleBar = ({
 }) => {
   const w = window as Window & { whisperer?: { minimize: () => void; maximize: () => void; close: () => void; startDrag?: () => void } };
   const winApi = w.whisperer;
+  const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");
   const buttons: { name: "minimize" | "maximize" | "close"; action: () => void }[] = [
     { name: "minimize", action: () => winApi?.minimize() },
     { name: "maximize", action: () => winApi?.maximize() },
@@ -174,27 +175,29 @@ export const TitleBar = ({
       <span style={{ flex: 1 }} />
       <div data-no-drag style={{ display: "flex", alignItems: "center", gap: 8, ...noDrag }}>
         <MicDropdown value={micName} onChange={onMicChange} options={micOptions} />
-        <div style={{ display: "flex", gap: 4, marginLeft: 4 }}>
-          {buttons.map((b) => (
-            <button
-              key={b.name}
-              onClick={b.action}
-              style={{
-                width: 26,
-                height: 26,
-                display: "grid",
-                placeItems: "center",
-                background: "transparent",
-                border: "1px solid transparent",
-                borderRadius: 6,
-                color: "var(--ink-2)",
-                cursor: "pointer",
-              }}
-            >
-              <Icon name={b.name} size={13} />
-            </button>
-          ))}
-        </div>
+        {!isMac && (
+          <div style={{ display: "flex", gap: 4, marginLeft: 4 }}>
+            {buttons.map((b) => (
+              <button
+                key={b.name}
+                onClick={b.action}
+                style={{
+                  width: 26,
+                  height: 26,
+                  display: "grid",
+                  placeItems: "center",
+                  background: "transparent",
+                  border: "1px solid transparent",
+                  borderRadius: 6,
+                  color: "var(--ink-2)",
+                  cursor: "pointer",
+                }}
+              >
+                <Icon name={b.name} size={13} />
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -4,8 +4,11 @@ All tuneable settings live here so you never have to dig through other files.
 """
 
 import os
+import sys
 
 VERSION = "5.5.2"
+IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = os.name == "nt"
 
 # =============================================================================
 # Paths
@@ -14,10 +17,13 @@ PROJECT_ROOT = os.environ.get("WHISPERER_PROJECT_ROOT", os.path.dirname(os.path.
 
 
 def _default_model_cache_dir() -> str:
+    if IS_MAC and (getattr(sys, "frozen", False) or ".app/Contents" in os.path.normpath(PROJECT_ROOT)):
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Whisperer", "models")
     if os.path.basename(PROJECT_ROOT).lower() == "_internal":
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        if local_appdata:
-            return os.path.join(local_appdata, "Whisperer", "models")
+        if IS_WINDOWS:
+            local_appdata = os.environ.get("LOCALAPPDATA")
+            if local_appdata:
+                return os.path.join(local_appdata, "Whisperer", "models")
     return os.path.join(PROJECT_ROOT, "models")
 
 
@@ -27,8 +33,8 @@ MODEL_CACHE_DIR = os.environ.get("WHISPERER_MODEL_CACHE_DIR", _default_model_cac
 # Whisper Engine
 # =============================================================================
 WHISPER_MODEL_SIZE = "deepdml/faster-whisper-large-v3-turbo-ct2"
-WHISPER_DEVICE = "cuda"
-WHISPER_COMPUTE_TYPE = "float16"
+WHISPER_DEVICE = os.environ.get("WHISPERER_WHISPER_DEVICE", "cuda" if IS_WINDOWS else "cpu")
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPERER_WHISPER_COMPUTE_TYPE", "float16" if IS_WINDOWS else "int8")
 WHISPER_BEAM_SIZE = 2  # Reduced from 5 for maximum speed (snappiness) without losing much accuracy
 WHISPER_LANGUAGE = "en"
 
@@ -43,12 +49,15 @@ AUDIO_BLOCKSIZE = 1024
 # =============================================================================
 # Global Hotkey
 # =============================================================================
-DICTATION_HOTKEY = "ctrl+left windows"
+DICTATION_HOTKEY = "ctrl+cmd" if IS_MAC else "ctrl+left windows"
 
 # =============================================================================
 # OCR / Context
 # =============================================================================
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_CMD = os.environ.get(
+    "TESSERACT_CMD",
+    "/opt/homebrew/bin/tesseract" if IS_MAC else r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+)
 OCR_ENABLED = True
 
 # =============================================================================

@@ -3,7 +3,10 @@ Transparent overlay window with a real-time audio waveform and custom dictionary
 Uses PyQt6 with a frameless, always-on-top, translucent window.
 """
 
+from __future__ import annotations
+
 import numpy as np
+import sys
 import time
 
 from PyQt6.QtCore import (
@@ -16,13 +19,23 @@ from PyQt6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
     QAbstractAnimation,
+    QEvent,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QLinearGradient, QPen, QBrush, QImage, QPixmap, QFont
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QLinearGradient, QPen, QBrush, QImage, QPixmap, QFont, QCursor
 from PyQt6.QtWidgets import QApplication, QWidget, QGraphicsOpacityEffect
 from PIL import Image, ImageFilter
 
 import config
+from ui.macos_glass import (
+    MacLiquidGlassUnderlay,
+    QtRect,
+    QtScreenGeometry,
+    configure_macos_overlay_window,
+    macos_left_mouse_button_down,
+    macos_window_number,
+    set_macos_window_ignores_mouse_events,
+)
 from core.settings import load_settings, save_settings
 
 NUM_BARS = 88
@@ -58,7 +71,7 @@ HOVER_DILATE_HEIGHT = 10
 HOVER_CONTROL_SPACE = 36
 HOVER_EASE_IN = 0.18
 HOVER_EASE_OUT = 0.12
-HOVER_ICON_EASE_IN = 0.26
+HOVER_ICON_EASE_IN = 0.40
 HOVER_ICON_EASE_OUT = 0.48
 DRAG_HANDLE_WIDTH = 34.0
 DRAG_HANDLE_HEIGHT = 3.5
@@ -73,6 +86,7 @@ CENTER_MAGNET_DIRECTION_SLOP = 8
 CENTER_MAGNET_HOLD_MS = 200
 SNAP_DURATION_MS = 260
 REPAINT_INTERVAL_MS = 16
+MOUSE_HOVER_POLL_MS = 16
 EXPANSION_SMOOTHING = 0.18
 MIN_VISIBLE_BARS = 9
 EXPANDED_VISIBLE_BARS = 34
@@ -81,18 +95,23 @@ BAR_GAP = 3.5
 BAR_WIDTH = 2.7
 DOT_SIZE = 3.2
 PROCESSING_DOT_COUNT = 9
-PROCESSING_WAVE_SPEED = 0.28
-PROCESSING_WAVE_HEIGHT = 3.4
-MINI_IDLE_WAVE_SPEED = PROCESSING_WAVE_SPEED * 0.21
+PROCESSING_WAVE_SPEED = 0.32
+PROCESSING_WAVE_HEIGHT = 4.8
+MINI_IDLE_WAVE_SPEED = 0.035
 IDLE_WAVE_HEIGHT = 2.4
 SILENCE_WAVE_DELAY_S = 0.5
 WAVE_BLEND_EASE_IN = 0.032
 WAVE_BLEND_EASE_OUT = 0.14
 WAVE_OFFSET_EASE_TO_SINE = 0.095
 WAVE_OFFSET_EASE_TO_CENTER = 0.20
-BLUR_CACHE_TTL_S = 30.0
-FADE_OUT_MS = 150
-WAVEFORM_COLOR = QColor(228, 229, 235, 230)
+VOICE_ACTIVITY_RMS_THRESHOLD = 0.0028
+VOICE_ACTIVITY_PEAK_THRESHOLD = 0.014
+BLUR_CACHE_TTL_S = 0.30
+FADE_OUT_MS = 80
+WAVEFORM_COLOR = QColor(248, 250, 255, 246)
+USE_NATIVE_GLASS_UNDERLAY = True
+ENABLE_SCREEN_CAPTURE_BLUR = False
+DEFAULT_GAUSSIAN_BLUR_RADIUS = 12.0
 MODEL_LOADING_LABEL_GAP = 6.0
 MODEL_LOADING_LABEL_HEIGHT = 18.0
 NO_AUDIO_INPUT_RMS = 0.00012
@@ -141,6 +160,9 @@ class WaveformOverlay(QWidget):
         self._loading_spin_phase = 0.0
         self._no_audio_since: float | None = None
         self._no_audio_warning = False
+        self._native_glass = MacLiquidGlassUnderlay() if USE_NATIVE_GLASS_UNDERLAY else None
+        self._native_glass_visible = False
+        self._target_opacity = self._load_overlay_opacity()
         self._init_window()
 
         self._opacity_effect = QGraphicsOpacityEffect(self)
@@ -150,6 +172,7 @@ class WaveformOverlay(QWidget):
         self._fade_anim = QPropertyAnimation(self._opacity_effect, b"opacity")
         self._fade_anim.setDuration(90)
         self._fade_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fade_anim.valueChanged.connect(self._on_overlay_opacity_changed)
 
         self._position_anim = QPropertyAnimation(self, b"pos")
         self._position_anim.setDuration(SNAP_DURATION_MS)
@@ -164,6 +187,11 @@ class WaveformOverlay(QWidget):
         self._repaint_timer = QTimer(self)
         self._repaint_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._repaint_timer.timeout.connect(self.update)
+
+        self._mouse_poll_timer = QTimer(self)
+        self._mouse_poll_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._mouse_poll_timer.timeout.connect(self._poll_mouse_interaction)
+
         self._blur_cache = None
         self._blur_cache_pixmap = QPixmap()
         self._blur_cache_ts = 0.0
@@ -171,6 +199,7 @@ class WaveformOverlay(QWidget):
         self._blur_request_id = 0
         self._blur_refresh_pending = False
         self._last_blur_refresh_request_ts = 0.0
+        self._last_drag_blur_refresh_ts = 0.0
 
         self._mode_name = ""
         self._state = "normal"
@@ -179,6 +208,8 @@ class WaveformOverlay(QWidget):
         self._processing = False
         self._processing_phase = 0.0
         self._idle_phase = 0.0
+        self._audio_rms = 0.0
+        self._audio_peak = 0.0
         self._wave_offsets = np.zeros(EXPANDED_VISIBLE_BARS, dtype=np.float64)
         self._speech_latched = False
         self._last_voice_time = 0.0
@@ -186,6 +217,7 @@ class WaveformOverlay(QWidget):
         self._wave_centered_by_audio = False
         self._idle_wave_allowed = True
         self._fading_out = False
+        self._hovering_interaction_zone = False
         self._hover_target = 0.0
         self._hover_progress = 0.0
         self._hover_icon_progress = 0.0
@@ -198,9 +230,36 @@ class WaveformOverlay(QWidget):
         self._stop_hit_rect = QRectF()
         self._no_audio_since = None
         self._no_audio_warning = False
+        self._mouse_passthrough = False
+        self._left_button_was_down = False
 
     def _reset_visual_gain(self):
         self._visual_gain = VISUAL_GAIN
+
+    def _load_overlay_opacity(self) -> float:
+        try:
+            overlay = load_settings().get("overlay", {})
+            if not isinstance(overlay, dict):
+                overlay = {}
+            value = overlay.get("opacity", config.OVERLAY_OPACITY)
+            return max(0.20, min(1.0, float(value)))
+        except Exception:
+            return max(0.20, min(1.0, float(getattr(config, "OVERLAY_OPACITY", 0.85))))
+
+    def _load_overlay_blur_radius(self) -> float:
+        try:
+            overlay = load_settings().get("overlay", {})
+            if not isinstance(overlay, dict):
+                overlay = {}
+            value = overlay.get("blur_radius", DEFAULT_GAUSSIAN_BLUR_RADIUS)
+            return max(0.0, min(18.0, float(value))) * 1.8
+        except Exception:
+            return DEFAULT_GAUSSIAN_BLUR_RADIUS
+
+    def _ensure_visual_timers(self):
+        self._word_timer.start(50)
+        self._repaint_timer.start(REPAINT_INTERVAL_MS)
+        self._start_mouse_polling()
 
     def _init_window(self):
         self.setWindowTitle("Whisper Overlay")
@@ -212,9 +271,293 @@ class WaveformOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        always_show_tool = getattr(Qt.WidgetAttribute, "WA_MacAlwaysShowToolWindow", None)
+        if always_show_tool is not None:
+            self.setAttribute(always_show_tool, True)
         self.setMouseTracking(True)
 
         self._position_on_screen()
+
+    def _should_passthrough_mouse(self) -> bool:
+        return False
+
+    def _set_mouse_passthrough(self, passthrough: bool):
+        passthrough = bool(passthrough)
+        if passthrough == self._mouse_passthrough:
+            if sys.platform == "darwin":
+                set_macos_window_ignores_mouse_events(int(self.winId()), passthrough)
+            return
+        self._mouse_passthrough = passthrough
+        if passthrough and self._dragging:
+            self._cancel_drag()
+        if passthrough:
+            self._collapse_hover_state_for_passthrough()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, passthrough)
+        if sys.platform == "darwin":
+            set_macos_window_ignores_mouse_events(int(self.winId()), passthrough)
+
+    def _refresh_mouse_passthrough(self):
+        self._set_mouse_passthrough(self._should_passthrough_mouse())
+
+    def _start_mouse_polling(self):
+        if not self._mouse_poll_timer.isActive():
+            self._mouse_poll_timer.start(MOUSE_HOVER_POLL_MS)
+
+    def _stop_mouse_polling(self):
+        self._mouse_poll_timer.stop()
+        self._hovering_interaction_zone = False
+
+    def _interaction_zone_rect(self) -> QRectF:
+        panel = self._panel_rect(self.width(), self.height())
+        horizontal_pad = max(28.0, HOVER_DILATE_WIDTH * 0.58)
+        top_pad = DRAG_HANDLE_GAP + DRAG_HANDLE_HEIGHT + 18.0
+        bottom_pad = max(18.0, HOVER_DILATE_HEIGHT + 12.0)
+        return panel.adjusted(-horizontal_pad, -top_pad, horizontal_pad, bottom_pad)
+
+    def _cursor_in_interaction_zone(self) -> bool:
+        if not self.isVisible():
+            return False
+        local = self.mapFromGlobal(QCursor.pos())
+        if not self.rect().contains(local):
+            return False
+        return self._interaction_zone_rect().contains(QPointF(local))
+
+    def _left_mouse_button_down(self) -> bool:
+        if sys.platform == "darwin" and macos_left_mouse_button_down():
+            return True
+        return bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+
+    def _cursor_in_drag_region(self) -> bool:
+        if not self.isVisible():
+            return False
+        local = self.mapFromGlobal(QCursor.pos())
+        if not self.rect().contains(local):
+            return False
+        local_pos = QPointF(local)
+        gear_rect, stop_rect = self._hover_control_hit_rects()
+        if gear_rect.contains(local_pos) or stop_rect.contains(local_pos):
+            return False
+        panel = self._panel_rect(self.width(), self.height())
+        drag_region = panel.adjusted(-22.0, -18.0, 22.0, 18.0)
+        return drag_region.contains(local_pos) or self._drag_handle_rect.contains(local_pos)
+
+    def _poll_mouse_interaction(self):
+        if not self.isVisible():
+            self._stop_mouse_polling()
+            self._set_mouse_passthrough(False)
+            self._left_button_was_down = False
+            return
+        hovering = self._cursor_in_interaction_zone()
+        left_down = self._left_mouse_button_down()
+        if not left_down:
+            self._left_button_was_down = False
+
+        if self._dragging:
+            self._hovering_interaction_zone = True
+            self._set_mouse_passthrough(False)
+            if left_down:
+                self._drag_to_global_position(QCursor.pos())
+            else:
+                self._finish_drag()
+            self._repaint_timer.start(REPAINT_INTERVAL_MS)
+            self.update()
+            return
+
+        self._hovering_interaction_zone = bool(hovering or self._dragging)
+        if self._hovering_interaction_zone and not self._fading_out:
+            self._hover_target = 1.0
+            self._set_mouse_passthrough(False)
+            self._configure_native_overlay_window(order_front=True)
+            self.raise_()
+            if left_down and not self._left_button_was_down:
+                self._left_button_was_down = True
+                local = QPointF(self.mapFromGlobal(QCursor.pos()))
+                gear_rect, stop_rect = self._hover_control_hit_rects()
+                if gear_rect.contains(local):
+                    print("OVERLAY_GEAR_CLICK", flush=True)
+                    self.open_ui_requested.emit()
+                    self._repaint_timer.start(REPAINT_INTERVAL_MS)
+                    self.update()
+                    return
+                if stop_rect.contains(local):
+                    print("OVERLAY_STOP_CLICK", flush=True)
+                    self.force_stop_requested.emit()
+                    self._repaint_timer.start(REPAINT_INTERVAL_MS)
+                    self.update()
+                    return
+            if left_down and self._cursor_in_drag_region():
+                self._begin_drag(QCursor.pos())
+                self._drag_to_global_position(QCursor.pos())
+            self._repaint_timer.start(REPAINT_INTERVAL_MS)
+            self.update()
+            return
+        if not self._dragging:
+            if self._hover_target != 0.0:
+                self._hover_target = 0.0
+                self._repaint_timer.start(REPAINT_INTERVAL_MS)
+                self.update()
+            self._refresh_mouse_passthrough()
+
+    def _clear_hover_state(self):
+        self._hovering_interaction_zone = False
+        self._hover_target = 0.0
+        self._hover_progress = 0.0
+        self._hover_icon_progress = 0.0
+        self._drag_handle_rect = QRectF()
+        self._gear_hit_rect = QRectF()
+        self._stop_hit_rect = QRectF()
+
+    def _collapse_hover_state_for_passthrough(self):
+        self._hovering_interaction_zone = False
+        self._hover_target = 0.0
+        self._drag_handle_rect = QRectF()
+        self._gear_hit_rect = QRectF()
+        self._stop_hit_rect = QRectF()
+        self._repaint_timer.start(REPAINT_INTERVAL_MS)
+        self.update()
+
+    def _cancel_drag(self):
+        if not self._dragging:
+            return
+        self._dragging = False
+        try:
+            self.releaseMouse()
+        except Exception:
+            pass
+        self._magnet_timer.stop()
+        self._drag_started_near_default = False
+        self._center_magnet_armed = False
+        self._last_default_distance = None
+        self._drag_available_geometry = None
+        self._drag_default_position = None
+        self._request_blur_refresh(0, force=True)
+
+    def _begin_drag(self, global_pos: QPoint):
+        self._stop_position_animation()
+        self._magnet_timer.stop()
+        self._dragging = True
+        self._hovering_interaction_zone = True
+        self._drag_offset = global_pos - self.frameGeometry().topLeft()
+        self._drag_available_geometry = self._available_geometry_for_position(self.pos())
+        self._drag_default_position = self._default_position()
+        self._drag_started_near_default = self._is_near_default_position(release=True)
+        self._center_magnet_armed = not self._drag_started_near_default
+        self._last_default_distance = self._default_position_distance()
+        self._set_mouse_passthrough(False)
+        try:
+            self.grabMouse()
+        except Exception:
+            pass
+        self._request_blur_refresh(0, force=True)
+        self._ensure_visual_timers()
+        self.update()
+
+    def _drag_to_global_position(self, global_pos: QPoint):
+        if not self._dragging:
+            return
+        self._stop_position_animation()
+        pos = global_pos - self._drag_offset
+        clamped = self._clamp_to_desktop(pos)
+        self.move(clamped)
+        distance = self._default_position_distance(clamped)
+        if self._drag_started_near_default and not self._center_magnet_armed:
+            if self._has_left_default_magnet_zone(clamped):
+                self._center_magnet_armed = True
+            self._magnet_timer.stop()
+        else:
+            moving_toward_default = (
+                distance is not None
+                and (
+                    self._last_default_distance is None
+                    or distance < self._last_default_distance - CENTER_MAGNET_DIRECTION_SLOP
+                )
+            )
+            if self._center_magnet_armed and self._is_near_default_position(clamped) and moving_toward_default:
+                self._magnet_timer.start(CENTER_MAGNET_HOLD_MS)
+            else:
+                self._magnet_timer.stop()
+        self._last_default_distance = distance
+        self._request_drag_blur_refresh()
+        self._ensure_visual_timers()
+        self.update()
+
+    def _finish_drag(self):
+        if not self._dragging:
+            return
+        self._dragging = False
+        try:
+            self.releaseMouse()
+        except Exception:
+            pass
+        self._magnet_timer.stop()
+        target = self._release_snap_target()
+        self._drag_started_near_default = False
+        self._center_magnet_armed = False
+        self._last_default_distance = None
+        self._drag_available_geometry = None
+        self._drag_default_position = None
+        if target is not None:
+            self._animate_to_position(target, save_when_done=True)
+        else:
+            self._save_position()
+        self._request_blur_refresh(0, force=True)
+        self._hovering_interaction_zone = self._cursor_in_interaction_zone()
+        self._refresh_mouse_passthrough()
+        if self._active or self._processing or self._loading_visual_active():
+            self._ensure_visual_timers()
+        self.update()
+
+    def _using_native_liquid_glass(self) -> bool:
+        return bool(
+            sys.platform == "darwin"
+            and self._native_glass is not None
+            and self._native_glass.is_available()
+        )
+
+    def _on_overlay_opacity_changed(self, value):
+        self._set_native_glass_alpha(float(value))
+
+    def _set_native_glass_alpha(self, alpha: float):
+        if self._using_native_liquid_glass():
+            self._native_glass.set_alpha(alpha)
+
+    def _configure_native_overlay_window(self, *, order_front: bool = False):
+        if sys.platform == "darwin":
+            configure_macos_overlay_window(int(self.winId()), order_front=order_front)
+
+    def _sync_native_glass(self, panel: QRectF | None = None, *, visible: bool | None = None, order_front: bool = False):
+        if not self._using_native_liquid_glass():
+            return
+        panel = self._panel_rect(self.width(), self.height()) if panel is None else panel
+        global_panel = self._panel_global_rect(self.pos())
+        if panel is not None:
+            global_panel = QRectF(
+                self.x() + panel.left(),
+                self.y() + panel.top(),
+                panel.width(),
+                panel.height(),
+            )
+        center = QPoint(round(global_panel.center().x()), round(global_panel.center().y()))
+        screen = QApplication.screenAt(center) or self.screen() or QApplication.primaryScreen()
+        if not screen:
+            self._native_glass.hide()
+            self._native_glass_visible = False
+            return
+        screen_geo = screen.geometry()
+        is_visible = self.isVisible() and not getattr(self, "_fading_out", False) if visible is None else visible
+        self._native_glass.set_frame(
+            QtRect(global_panel.left(), global_panel.top(), global_panel.width(), global_panel.height()),
+            QtScreenGeometry(screen_geo.x(), screen_geo.y(), screen_geo.width(), screen_geo.height()),
+            corner_radius=global_panel.height() / 2,
+            visible=is_visible,
+            order_front=order_front,
+        )
+        self._native_glass_visible = bool(is_visible)
+
+    def _hide_native_glass(self):
+        if self._using_native_liquid_glass():
+            self._native_glass.hide()
+        self._native_glass_visible = False
 
     def _desktop_geometry(self) -> QRect:
         screens = QApplication.screens()
@@ -261,7 +604,19 @@ class WaveformOverlay(QWidget):
         self._blur_cache_pixmap = QPixmap()
         self._blur_cache_key = None
 
-    def _request_blur_refresh(self, delay_ms: int = 120, *, force: bool = False):
+    def _request_drag_blur_refresh(self):
+        now = time.monotonic()
+        if now - self._last_drag_blur_refresh_ts < 0.10:
+            return
+        self._last_drag_blur_refresh_ts = now
+        self._request_blur_refresh(0, force=True)
+
+    def _request_blur_refresh(self, delay_ms: int = 24, *, force: bool = False):
+        if self._using_native_liquid_glass() or (sys.platform == "darwin" and not ENABLE_SCREEN_CAPTURE_BLUR):
+            self._blur_refresh_pending = False
+            self._clear_blur_cache()
+            self.update()
+            return
         now = time.monotonic()
         if not force and (self._blur_refresh_pending or now - self._last_blur_refresh_request_ts < 0.30):
             return
@@ -269,7 +624,8 @@ class WaveformOverlay(QWidget):
         self._blur_refresh_pending = True
         self._blur_request_id += 1
         blur_request_id = self._blur_request_id
-        screen = self.screen()
+        panel_center = self._panel_global_rect().center().toPoint()
+        screen = QApplication.screenAt(panel_center) or self.screen() or QApplication.primaryScreen()
         if not screen:
             self._blur_refresh_pending = False
             self.update()
@@ -295,6 +651,43 @@ class WaveformOverlay(QWidget):
             lambda: self._grab_blur_then_show(
                 blur_request_id, screen, px_x, px_y, px_w, px_h, ratio, w, h
             ),
+        )
+
+    def _capture_blur_now(self):
+        if self._using_native_liquid_glass() or (sys.platform == "darwin" and not ENABLE_SCREEN_CAPTURE_BLUR):
+            self._blur_refresh_pending = False
+            self._clear_blur_cache()
+            return
+        self._blur_refresh_pending = True
+        self._blur_request_id += 1
+        blur_request_id = self._blur_request_id
+        panel_center = self._panel_global_rect().center().toPoint()
+        screen = QApplication.screenAt(panel_center) or self.screen() or QApplication.primaryScreen()
+        if not screen:
+            self._blur_refresh_pending = False
+            return
+
+        ratio = screen.devicePixelRatio()
+        geo = self.geometry()
+        scr_geo = screen.geometry()
+        local_x = geo.x() - scr_geo.x()
+        local_y = geo.y() - scr_geo.y()
+        w, h = geo.width(), geo.height()
+        px_w = int(w * ratio)
+        px_h = int(h * ratio)
+        if px_w <= 0 or px_h <= 0:
+            self._blur_refresh_pending = False
+            return
+        self._grab_blur_then_show(
+            blur_request_id,
+            screen,
+            int(local_x * ratio),
+            int(local_y * ratio),
+            px_w,
+            px_h,
+            ratio,
+            w,
+            h,
         )
 
     def _stop_position_animation(self):
@@ -433,6 +826,7 @@ class WaveformOverlay(QWidget):
 
     def _on_position_animation_finished(self):
         self._clear_blur_cache()
+        self._request_blur_refresh(0, force=True)
         if self._save_after_position_anim:
             self._save_position()
             self._save_after_position_anim = False
@@ -450,10 +844,11 @@ class WaveformOverlay(QWidget):
         self._last_default_distance = None
         self._drag_available_geometry = None
         self._drag_default_position = None
-        self._clear_blur_cache()
+        self._request_blur_refresh(0, force=True)
         self._animate_to_position(target, save_when_done=True)
 
     def fade_in(self, *, keep_model_loading: bool = False):
+        self._target_opacity = self._load_overlay_opacity()
         self._position_on_screen()
         self._bar_heights[:] = 0.0
         self._reset_visual_gain()
@@ -475,6 +870,7 @@ class WaveformOverlay(QWidget):
         self._wave_centered_by_audio = False
         self._idle_wave_allowed = True
         self._fading_out = False
+        self._hovering_interaction_zone = False
         self._hover_target = 0.0
         self._hover_progress = 0.0
         self._hover_icon_progress = 0.0
@@ -487,37 +883,89 @@ class WaveformOverlay(QWidget):
         self._no_audio_warning = False
         self._gear_hit_rect = QRectF()
         self._stop_hit_rect = QRectF()
+        self._refresh_mouse_passthrough()
         
-        self._word_timer.start(50)
-        self._repaint_timer.start(REPAINT_INTERVAL_MS)
+        self._ensure_visual_timers()
         self._fade_anim.stop()
         try:
             self._fade_anim.finished.disconnect(self._on_fade_out_done)
         except TypeError:
             pass
-        self._fade_anim.setDuration(90)
-        self._fade_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        self._fade_anim.setStartValue(self._opacity_effect.opacity())
-        self._fade_anim.setEndValue(1.0)
+        self._opacity_effect.setOpacity(self._target_opacity)
+        self._set_native_glass_alpha(self._target_opacity)
+        self._set_mouse_passthrough(False)
+        self._capture_blur_now()
 
         self.show()
+        self._configure_native_overlay_window(order_front=True)
+        self._sync_native_glass(visible=True, order_front=True)
+        self._poll_mouse_interaction()
         self.raise_()
-        self._fade_anim.start()
-        self._request_blur_refresh(120)
+        self._request_blur_refresh(12)
+
+    def _grab_macos_window_below(self, screen, x: float, y: float, w: float, h: float, ratio: float) -> QImage:
+        if not ENABLE_SCREEN_CAPTURE_BLUR or sys.platform != "darwin" or w <= 0 or h <= 0:
+            return QImage()
+        try:
+            window_id = macos_window_number(int(self.winId()))
+            if not window_id:
+                return QImage()
+            Quartz = __import__("Quartz")
+            AppKit = __import__("AppKit", fromlist=["NSBitmapImageFileTypePNG", "NSBitmapImageRep"])
+
+            rect = Quartz.CGRectMake(float(x), float(y), float(w), float(h))
+            image_options = getattr(Quartz, "kCGWindowImageBoundsIgnoreFraming", 0)
+            cg_image = Quartz.CGWindowListCreateImage(
+                rect,
+                Quartz.kCGWindowListOptionOnScreenBelowWindow,
+                window_id,
+                image_options,
+            )
+            if not cg_image:
+                return QImage()
+            rep = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(cg_image)
+            png_data = rep.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
+            if not png_data:
+                return QImage()
+            image = QImage.fromData(bytes(png_data), "PNG")
+            if not image.isNull():
+                image.setDevicePixelRatio(max(1.0, float(ratio or 1.0)))
+            return image
+        except Exception:
+            return QImage()
 
     def _grab_blur_then_show(self, request_id, screen, px_x, px_y, px_w, px_h, ratio, logic_w, logical_h):
         if request_id != self._blur_request_id:
             self._blur_refresh_pending = False
             return
+        was_visible = self.isVisible()
         try:
             logical_ratio = max(1.0, float(ratio or 1.0))
             scr_geo = screen.geometry()
             logical_w = max(1, int(logic_w))
             logical_h = max(1, int(logical_h))
+            global_x = scr_geo.x() + (float(px_x) / logical_ratio)
+            global_y = scr_geo.y() + (float(px_y) / logical_ratio)
+            img = QImage()
+            if was_visible:
+                img = self._grab_macos_window_below(
+                    screen,
+                    global_x,
+                    global_y,
+                    logical_w,
+                    logical_h,
+                    logical_ratio,
+                )
+
+            if was_visible and img.isNull() and sys.platform != "darwin":
+                self.hide()
+                QApplication.processEvents()
             logical_x = max(0, min(round(px_x / logical_ratio), max(0, scr_geo.width() - logical_w)))
             logical_y = max(0, min(round(px_y / logical_ratio), max(0, scr_geo.height() - logical_h)))
 
-            pixmap = screen.grabWindow(0, logical_x, logical_y, logical_w, logical_h)
+            pixmap = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
+            if pixmap.isNull():
+                pixmap = screen.grabWindow(0, logical_x, logical_y, logical_w, logical_h)
             if pixmap.isNull():
                 full = screen.grabWindow(0)
                 if not full.isNull():
@@ -552,11 +1000,8 @@ class WaveformOverlay(QWidget):
                         b, g, r, a = pil_img.split()
                         pil_img = Image.merge("RGBA", (r, g, b, a))
                         
-                        # Apply fast blur (scaled by ratio to keep effect consistent)
-                        # We use a smaller radius (12 instead of 18) for a tighter blur
-                        # BoxBlur is already the fastest high-quality blur available in Python/Pillow
-                        # that gives a real frosted glass effect without tanking performance.
-                        blurred_pil = pil_img.filter(ImageFilter.BoxBlur(12 * ratio))
+                        radius = self._load_overlay_blur_radius() * float(ratio or 1.0)
+                        blurred_pil = pil_img.filter(ImageFilter.GaussianBlur(max(0.0, radius)))
                         
                         # Back to numpy, swap channels back to BGRA for Qt
                         arr_blur = np.array(blurred_pil)
@@ -576,13 +1021,32 @@ class WaveformOverlay(QWidget):
             print(f"Blur failed: {e}")
             pass
         finally:
+            if was_visible and sys.platform != "darwin" and request_id == self._blur_request_id:
+                self.show()
+                self._configure_native_overlay_window(order_front=True)
+                self._sync_native_glass(visible=True, order_front=True)
+                self.raise_()
             if request_id == self._blur_request_id:
                 self._blur_refresh_pending = False
+
+    def hide_now(self):
+        self._blur_request_id += 1
+        self._blur_refresh_pending = False
+        self._fade_anim.stop()
+        try:
+            self._fade_anim.finished.disconnect(self._on_fade_out_done)
+        except TypeError:
+            pass
+        self._opacity_effect.setOpacity(0.0)
+        self._set_native_glass_alpha(0.0)
+        self._on_fade_out_done()
 
     def fade_out(self):
         self._blur_request_id += 1
         self._blur_refresh_pending = False
         self._fading_out = True
+        self._hovering_interaction_zone = False
+        self._refresh_mouse_passthrough()
         self._repaint_timer.start(REPAINT_INTERVAL_MS)
         self._fade_anim.stop()
         self._fade_anim.setDuration(FADE_OUT_MS)
@@ -599,6 +1063,7 @@ class WaveformOverlay(QWidget):
     def _on_fade_out_done(self):
         self._repaint_timer.stop()
         self._word_timer.stop()
+        self._stop_mouse_polling()
         self._audio_chunk = None
         self._active = False
         self._locked = False
@@ -627,11 +1092,33 @@ class WaveformOverlay(QWidget):
         self._bar_heights[:] = 0.0
         self._reset_visual_gain()
         self._expansion = 0.0
+        self._set_mouse_passthrough(False)
+        self._hide_native_glass()
         self.hide()
         try:
             self._fade_anim.finished.disconnect(self._on_fade_out_done)
         except TypeError:
             pass
+
+    def _measure_audio_activity(self, chunk: np.ndarray | None) -> tuple[float, float]:
+        if chunk is None or len(chunk) == 0:
+            return 0.0, 0.0
+        try:
+            data = chunk.astype(np.float32, copy=False)
+            rms = float(np.sqrt(np.mean(data * data)))
+            peak = float(np.max(np.abs(data))) if len(data) else 0.0
+            return rms, peak
+        except Exception:
+            return 0.0, 0.0
+
+    def _voice_activity_detected(self, bar_peak: float) -> bool:
+        if not self._active or self._audio_chunk is None:
+            return False
+        raw_signal = (
+            self._audio_rms >= VOICE_ACTIVITY_RMS_THRESHOLD
+            or self._audio_peak >= VOICE_ACTIVITY_PEAK_THRESHOLD
+        )
+        return raw_signal and bar_peak > SPEAKING_THRESHOLD
 
     def _update_no_audio_warning(self, chunk: np.ndarray | None):
         if not self._active or self._processing or self._model_loading or self._fading_out:
@@ -643,13 +1130,7 @@ class WaveformOverlay(QWidget):
 
         no_input = chunk is None or len(chunk) == 0
         if not no_input:
-            try:
-                data = chunk.astype(np.float32, copy=False)
-                rms = float(np.sqrt(np.mean(data * data)))
-                peak = float(np.max(np.abs(data))) if len(data) else 0.0
-                no_input = rms <= NO_AUDIO_INPUT_RMS and peak <= NO_AUDIO_INPUT_RMS * 4.0
-            except Exception:
-                no_input = True
+            no_input = self._audio_rms <= NO_AUDIO_INPUT_RMS and self._audio_peak <= NO_AUDIO_INPUT_RMS * 4.0
 
         if no_input:
             now = time.monotonic()
@@ -666,6 +1147,7 @@ class WaveformOverlay(QWidget):
 
     def set_audio_chunk(self, chunk: np.ndarray | None):
         self._audio_chunk = chunk
+        self._audio_rms, self._audio_peak = self._measure_audio_activity(chunk)
         self._update_no_audio_warning(chunk)
 
     def set_active(self, active: bool):
@@ -691,6 +1173,14 @@ class WaveformOverlay(QWidget):
                 self._wave_centered_by_audio = False
                 self._idle_wave_allowed = True
                 self._wave_offsets[:] = 0.0
+        self._refresh_mouse_passthrough()
+        if self.isVisible():
+            self._ensure_visual_timers()
+            self._poll_mouse_interaction()
+            if active:
+                self._configure_native_overlay_window(order_front=True)
+                self._sync_native_glass(visible=True, order_front=True)
+        self.update()
 
     def set_status(self, text: str):
         self._status_text = text
@@ -741,10 +1231,15 @@ class WaveformOverlay(QWidget):
         self.set_model_loading(False)
 
     def show_model_loading(self):
+        self._target_opacity = self._load_overlay_opacity()
         if self.isVisible() and self._model_loading and not self._fading_out:
             self._word_timer.start(50)
             self._repaint_timer.start(REPAINT_INTERVAL_MS)
+            self._start_mouse_polling()
             self.show()
+            self._configure_native_overlay_window(order_front=True)
+            self._sync_native_glass(visible=True, order_front=True)
+            self._poll_mouse_interaction()
             self.raise_()
             self._request_blur_refresh(90)
             self.update()
@@ -754,6 +1249,7 @@ class WaveformOverlay(QWidget):
             self._fading_out = False
             self._word_timer.start(50)
             self._repaint_timer.start(REPAINT_INTERVAL_MS)
+            self._start_mouse_polling()
             self._fade_anim.stop()
             try:
                 self._fade_anim.finished.disconnect(self._on_fade_out_done)
@@ -762,8 +1258,11 @@ class WaveformOverlay(QWidget):
             self._fade_anim.setDuration(80)
             self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
             self._fade_anim.setStartValue(self._opacity_effect.opacity())
-            self._fade_anim.setEndValue(1.0)
+            self._fade_anim.setEndValue(self._target_opacity)
             self.show()
+            self._configure_native_overlay_window(order_front=True)
+            self._sync_native_glass(visible=True, order_front=True)
+            self._poll_mouse_interaction()
             self.raise_()
             self._fade_anim.start()
             self._request_blur_refresh(80, force=True)
@@ -792,6 +1291,10 @@ class WaveformOverlay(QWidget):
             self._active = False
             self._locked = False
             self._audio_chunk = None
+            self._model_loading = False
+            self._loading_ready_preview = False
+            self._loading_morph = 1.0
+            self._loading_morph_target = 1.0
             self._state = "normal"
             self._speech_latched = False
             self._last_voice_time = 0.0
@@ -801,17 +1304,70 @@ class WaveformOverlay(QWidget):
             self._wave_offsets[:] = 0.0
             self._bar_heights[:] = 0.0
             self._reset_visual_gain()
+            self._expansion = min(self._expansion, 0.14)
             self._processing_phase = 0.0
-            self._repaint_timer.start(REPAINT_INTERVAL_MS)
+            self._ensure_visual_timers()
+            if not self.isVisible():
+                self.show()
+            self._fade_anim.stop()
+            self._target_opacity = self._load_overlay_opacity()
+            self._opacity_effect.setOpacity(self._target_opacity)
+            self._set_native_glass_alpha(self._target_opacity)
+            self._request_blur_refresh(0, force=True)
+        elif not self._active:
+            self._processing_phase = 0.0
+        self._refresh_mouse_passthrough()
+        if self.isVisible():
+            if processing:
+                self._configure_native_overlay_window(order_front=True)
+                self._sync_native_glass(visible=True, order_front=True)
+                self.raise_()
+            self._poll_mouse_interaction()
         self.update()
 
+    def showEvent(self, event):
+        self._configure_native_overlay_window(order_front=True)
+        super().showEvent(event)
+
+    def changeEvent(self, event):
+        if (
+            sys.platform == "darwin"
+            and self.isVisible()
+            and event.type() in (QEvent.Type.ActivationChange, QEvent.Type.WindowStateChange)
+        ):
+            self._configure_native_overlay_window(order_front=True)
+            self._sync_native_glass(visible=True, order_front=True)
+            self._repaint_timer.start(REPAINT_INTERVAL_MS)
+            self.raise_()
+            self.update()
+        super().changeEvent(event)
+
+    def moveEvent(self, event):
+        self._sync_native_glass()
+        super().moveEvent(event)
+
+    def hideEvent(self, event):
+        self._hide_native_glass()
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        if self._native_glass is not None:
+            self._native_glass.close()
+        super().closeEvent(event)
+
     def enterEvent(self, event):
+        if self._mouse_passthrough:
+            event.ignore()
+            return
         self._hover_target = 1.0
         self._repaint_timer.start(REPAINT_INTERVAL_MS)
         self.update()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        if self._mouse_passthrough:
+            event.ignore()
+            return
         if not self._dragging:
             self._hover_target = 0.0
             self._repaint_timer.start(REPAINT_INTERVAL_MS)
@@ -819,77 +1375,48 @@ class WaveformOverlay(QWidget):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
+        if self._mouse_passthrough:
+            event.ignore()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.position()
-            if self._gear_hit_rect.contains(pos):
+            gear_rect, stop_rect = self._hover_control_hit_rects()
+            if gear_rect.contains(pos):
+                print("OVERLAY_GEAR_CLICK", flush=True)
                 self.open_ui_requested.emit()
                 event.accept()
                 return
-            if self._stop_hit_rect.contains(pos):
+            if stop_rect.contains(pos):
+                print("OVERLAY_STOP_CLICK", flush=True)
                 self.force_stop_requested.emit()
                 event.accept()
                 return
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.position()
             panel = self._panel_rect(self.width(), self.height())
-            if panel.contains(pos) or self._drag_handle_rect.contains(pos):
-                self._stop_position_animation()
-                self._magnet_timer.stop()
-                self._dragging = True
-                self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-                self._drag_available_geometry = self._available_geometry_for_position(self.pos())
-                self._drag_default_position = self._default_position()
-                self._drag_started_near_default = self._is_near_default_position(release=True)
-                self._center_magnet_armed = not self._drag_started_near_default
-                self._last_default_distance = self._default_position_distance()
+            drag_region = panel.adjusted(-22.0, -18.0, 22.0, 18.0)
+            if drag_region.contains(pos) or self._drag_handle_rect.contains(pos):
+                self._begin_drag(event.globalPosition().toPoint())
                 event.accept()
                 return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._mouse_passthrough:
+            event.ignore()
+            return
         if self._dragging and event.buttons() & Qt.MouseButton.LeftButton:
-            self._stop_position_animation()
-            pos = event.globalPosition().toPoint() - self._drag_offset
-            clamped = self._clamp_to_desktop(pos)
-            self.move(clamped)
-            distance = self._default_position_distance(clamped)
-            if self._drag_started_near_default and not self._center_magnet_armed:
-                if self._has_left_default_magnet_zone(clamped):
-                    self._center_magnet_armed = True
-                self._magnet_timer.stop()
-            else:
-                moving_toward_default = (
-                    distance is not None
-                    and (
-                        self._last_default_distance is None
-                        or distance < self._last_default_distance - CENTER_MAGNET_DIRECTION_SLOP
-                    )
-                )
-                if self._center_magnet_armed and self._is_near_default_position(clamped) and moving_toward_default:
-                    self._magnet_timer.start(CENTER_MAGNET_HOLD_MS)
-                else:
-                    self._magnet_timer.stop()
-            self._last_default_distance = distance
-            self.update()
+            self._drag_to_global_position(event.globalPosition().toPoint())
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._mouse_passthrough:
+            event.ignore()
+            return
         if self._dragging and event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = False
-            self._magnet_timer.stop()
-            target = self._release_snap_target()
-            self._drag_started_near_default = False
-            self._center_magnet_armed = False
-            self._last_default_distance = None
-            self._drag_available_geometry = None
-            self._drag_default_position = None
-            self._clear_blur_cache()
-            if target is not None:
-                self._animate_to_position(target, save_when_done=True)
-            else:
-                self._save_position()
+            self._finish_drag()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -913,8 +1440,11 @@ class WaveformOverlay(QWidget):
         self._wave_offsets[:] = 0.0
         self._fading_out = False
         self.show()
+        self._sync_native_glass(visible=True, order_front=True)
         self.raise_()
-        self._opacity_effect.setOpacity(1.0)
+        self._target_opacity = self._load_overlay_opacity()
+        self._opacity_effect.setOpacity(self._target_opacity)
+        self._set_native_glass_alpha(self._target_opacity)
         self._repaint_timer.start(REPAINT_INTERVAL_MS)
         QTimer.singleShot(800, self.fade_out)
 
@@ -937,8 +1467,11 @@ class WaveformOverlay(QWidget):
         self._wave_offsets[:] = 0.0
         self._fading_out = False
         self.show()
+        self._sync_native_glass(visible=True, order_front=True)
         self.raise_()
-        self._opacity_effect.setOpacity(1.0)
+        self._target_opacity = self._load_overlay_opacity()
+        self._opacity_effect.setOpacity(self._target_opacity)
+        self._set_native_glass_alpha(self._target_opacity)
         self._repaint_timer.start(REPAINT_INTERVAL_MS)
         QTimer.singleShot(2000, self.fade_out)
 
@@ -1020,13 +1553,12 @@ class WaveformOverlay(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        painter.fillRect(event.rect(), QColor(0, 0, 0, 0))
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         w, h = self.width(), self.height()
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor(0, 0, 0, 0)))
-        painter.drawRect(0, 0, w, h)
 
         if self._fading_out:
             targets = self._bar_heights
@@ -1034,7 +1566,7 @@ class WaveformOverlay(QWidget):
             targets = self._compute_bar_targets()
             self._bar_heights += (targets - self._bar_heights) * SMOOTHING
         bar_peak = float(np.max(self._bar_heights))
-        voice_detected = self._active and bar_peak > SPEAKING_THRESHOLD
+        voice_detected = self._voice_activity_detected(bar_peak)
         wave_centered_by_audio = self._active and bar_peak > WAVE_CENTER_THRESHOLD
         if not self._fading_out:
             self._wave_centered_by_audio = wave_centered_by_audio
@@ -1101,6 +1633,13 @@ class WaveformOverlay(QWidget):
         lock_target = 1.0 if self._locked else 0.0
         self._lock_glow += (lock_target - self._lock_glow) * 0.24
         panel = self._panel_rect(w, h)
+        self._sync_native_glass(panel)
+        if (
+            not self._using_native_liquid_glass()
+            and not self._blur_refresh_pending
+            and now - self._blur_cache_ts > BLUR_CACHE_TTL_S
+        ):
+            self._request_blur_refresh(0, force=True)
 
         self._draw_blurred_background(painter, panel)
         self._draw_drag_handle(painter, panel)
@@ -1137,31 +1676,35 @@ class WaveformOverlay(QWidget):
         return QRectF(x, y, width, height)
 
     def _draw_blurred_background(self, painter: QPainter, panel: QRectF):
-        """Draw a SuperWhisper-like compact recording panel."""
+        """Draw one translucent, Gaussian-blurred pill surface."""
         capsule = panel
         radius = panel.height() / 2
         path = QPainterPath()
         path.addRoundedRect(capsule, radius, radius)
 
-        if self._blur_cache_pixmap and not self._blur_cache_pixmap.isNull() and not self._dragging:
+        if (
+            self._blur_cache_pixmap
+            and not self._blur_cache_pixmap.isNull()
+        ):
             painter.save()
             painter.setClipPath(path)
             painter.drawPixmap(0, 0, self._blur_cache_pixmap)
             painter.restore()
 
         if self._state == "error":
-            fill = QColor(60, 20, 20, 128)
+            fill = QColor(60, 20, 20, 112)
         elif self._state == "cancelled":
-            fill = QColor(28, 28, 31, 128)
+            fill = QColor(28, 28, 31, 104)
         else:
-            fill = QColor(28, 29, 32, 128)
+            fill_alpha = 72 if self._using_native_liquid_glass() else 104
+            fill = QColor(28, 29, 32, fill_alpha)
             if self._lock_glow > 0.01:
                 glow = self._lock_glow
                 fill = QColor(
                     int(28 + 18 * glow),
                     int(29 + 18 * glow),
                     int(32 + 22 * glow),
-                    int(128 + 22 * glow),
+                    int(fill_alpha + 22 * glow),
                 )
 
         painter.fillPath(path, fill)
@@ -1288,7 +1831,7 @@ class WaveformOverlay(QWidget):
                 continue
 
             wave_offset = 0.0
-            if self._processing and not self._active:
+            if self._processing:
                 angle = ((visible_slot - self._processing_phase) / PROCESSING_DOT_COUNT) * np.pi * 2.0
                 wave_offset = float(np.sin(angle)) * PROCESSING_WAVE_HEIGHT
             elif (self._active or self._model_loading) and not self._processing:
@@ -1326,11 +1869,11 @@ class WaveformOverlay(QWidget):
             else:
                 color = QColor(WAVEFORM_COLOR)
                 color.setAlpha(int(WAVEFORM_COLOR.alpha() * edge_alpha))
-                if self._processing and not self._active:
+                if self._processing:
                     color.setAlpha(int(WAVEFORM_COLOR.alpha() * edge_alpha * 0.92))
             painter.setBrush(color)
 
-            if is_idle or (self._processing and not self._active):
+            if is_idle or self._processing:
                 dot_size = DOT_SIZE
                 dot_y = center_y
                 if wave_offset:
@@ -1344,6 +1887,25 @@ class WaveformOverlay(QWidget):
             visible_slot += 1
         painter.restore()
 
+    def _hover_control_centers(self, panel: QRectF | None = None) -> tuple[QPointF, QPointF]:
+        panel = self._panel_rect(self.width(), self.height()) if panel is None else panel
+        center_y = panel.center().y()
+        if self._loading_visual_active() and self._loading_morph < 0.35:
+            distance = LOADING_HOVER_ICON_DISTANCE + 6.0 * self._hover_progress
+            left_center = QPointF(panel.center().x() - distance, center_y)
+            right_center = QPointF(panel.center().x() + distance, center_y)
+        else:
+            left_center = QPointF(panel.left() + 22.0 + 6.0 * self._hover_progress, center_y)
+            right_center = QPointF(panel.right() - 22.0 - 6.0 * self._hover_progress, center_y)
+        return left_center, right_center
+
+    def _hover_control_hit_rects(self, panel: QRectF | None = None) -> tuple[QRectF, QRectF]:
+        left_center, right_center = self._hover_control_centers(panel)
+        hit_size = 42.0
+        gear = QRectF(left_center.x() - hit_size / 2, left_center.y() - hit_size / 2, hit_size, hit_size)
+        stop = QRectF(right_center.x() - hit_size / 2, right_center.y() - hit_size / 2, hit_size, hit_size)
+        return gear, stop
+
     def _draw_hover_controls(self, painter: QPainter, panel: QRectF):
         icon_progress = min(1.0, max(0.0, self._hover_icon_progress))
         alpha = int(210 * icon_progress)
@@ -1353,17 +1915,8 @@ class WaveformOverlay(QWidget):
             return
 
         icon_size = 18.0
-        hit_size = 34.0
-        center_y = panel.center().y()
-        if self._loading_visual_active() and self._loading_morph < 0.35:
-            distance = LOADING_HOVER_ICON_DISTANCE + 6.0 * self._hover_progress
-            left_center = QPointF(panel.center().x() - distance, center_y)
-            right_center = QPointF(panel.center().x() + distance, center_y)
-        else:
-            left_center = QPointF(panel.left() + 22.0 + 6.0 * self._hover_progress, center_y)
-            right_center = QPointF(panel.right() - 22.0 - 6.0 * self._hover_progress, center_y)
-        self._gear_hit_rect = QRectF(left_center.x() - hit_size / 2, center_y - hit_size / 2, hit_size, hit_size)
-        self._stop_hit_rect = QRectF(right_center.x() - hit_size / 2, center_y - hit_size / 2, hit_size, hit_size)
+        left_center, right_center = self._hover_control_centers(panel)
+        self._gear_hit_rect, self._stop_hit_rect = self._hover_control_hit_rects(panel)
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)

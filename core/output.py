@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 import threading
 
@@ -12,10 +13,15 @@ except Exception:
     _CLIPBOARD_AVAILABLE = False
 
 try:
-    import keyboard
-    _KEYBOARD_AVAILABLE = True
+    from core import hotkeys
+    _HOTKEYS_AVAILABLE = True
 except Exception:
-    _KEYBOARD_AVAILABLE = False
+    hotkeys = None
+    _HOTKEYS_AVAILABLE = False
+
+
+def _paste_shortcut() -> str:
+    return "cmd+v" if sys.platform == "darwin" else "ctrl+v"
 
 
 def _restore_clipboard_later(old: str, delay: float = 0.8):
@@ -39,8 +45,8 @@ def paste_text(
     Deliver text to the active window.
 
     method:
-        clipboard_paste — copy to clipboard then Ctrl+V
-        simulate_keys   — type character by character (keyboard.write)
+        clipboard_paste — copy to clipboard then paste shortcut
+        simulate_keys   — type character by character
         copy_only       — copy to clipboard but do not paste
 
     Returns True if the method executed without known errors.
@@ -62,19 +68,26 @@ def paste_text(
             pyperclip.copy(text)
         # tiny pause so the OS registers the clipboard update
         time.sleep(max(0, int(paste_delay_ms)) / 1000.0)
-        if _KEYBOARD_AVAILABLE:
-            keyboard.send("ctrl+v")
+        if sys.platform == "darwin" and active_app:
+            try:
+                from core.native import activate_application_process
+
+                activate_application_process(active_app)
+            except Exception:
+                pass
+        if _HOTKEYS_AVAILABLE and hotkeys is not None:
+            hotkeys.send(_paste_shortcut())
         if restore_clipboard and _CLIPBOARD_AVAILABLE:
             _restore_clipboard_later(old_clipboard)
-        if auto_send and _KEYBOARD_AVAILABLE:
-            keyboard.send("enter")
+        if auto_send and _HOTKEYS_AVAILABLE and hotkeys is not None:
+            hotkeys.send("enter")
         return True
 
     if method == "simulate_keys":
-        if _KEYBOARD_AVAILABLE:
-            keyboard.write(text, delay=0.01)
-        if auto_send and _KEYBOARD_AVAILABLE:
-            keyboard.send("enter")
+        if _HOTKEYS_AVAILABLE and hotkeys is not None:
+            hotkeys.write(text, delay=0.01)
+        if auto_send and _HOTKEYS_AVAILABLE and hotkeys is not None:
+            hotkeys.send("enter")
         return True
 
     return False

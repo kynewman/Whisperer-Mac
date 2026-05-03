@@ -12,6 +12,7 @@ from core.providers import LLMProvider
 
 
 log = logging.getLogger("whisperer.llm")
+API_USER_AGENT = "Whisperer/5.5.2"
 
 
 BUILTIN_PROMPT_TEMPLATES: Dict[str, str] = {
@@ -30,7 +31,12 @@ BUILTIN_PROMPT_TEMPLATES: Dict[str, str] = {
 
 def _post_json(url: str, payload: dict, headers: dict, timeout_s: int) -> dict:
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **headers}, method="POST")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": API_USER_AGENT, "Accept": "application/json", **headers},
+        method="POST",
+    )
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         return json.loads(resp.read().decode("utf-8"))
 

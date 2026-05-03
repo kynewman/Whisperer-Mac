@@ -1,0 +1,32 @@
+# =============================================================================
+# Whisperer macOS dependencies
+# =============================================================================
+# Recommended:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements-macos.txt
+#
+# macOS uses faster-whisper on CPU by default for stability. Parakeet/NeMo is
+# intentionally not part of this default install because it is far heavier and
+# less predictable on macOS.
+# =============================================================================
+
+faster-whisper>=1.1.0
+
+sounddevice>=0.5.1
+numpy>=1.26.0
+
+mss>=9.0.1
+Pillow>=10.4.0
+pytesseract>=0.3.13
+
+pynput>=1.7.7
+pyperclip>=1.8.2
+keyring>=24.0.0
+
+PyQt6>=6.7.0
+PyQt6-WebEngine>=6.7.0
+pyqtgraph>=0.13.7
+
+colorama>=0.4.6

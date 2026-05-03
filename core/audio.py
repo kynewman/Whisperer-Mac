@@ -7,6 +7,8 @@ Also maintains a rolling window of recent samples for smooth waveform
 visualisation.
 """
 
+from __future__ import annotations
+
 import threading
 
 import numpy as np

@@ -10,17 +10,15 @@ from __future__ import annotations
 import os
 import shutil
 
+from core.native import app_support_dir
 
-APP_NAME = "Whisperer Windows"
+APP_NAME = "Whisperer"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def get_app_data_dir() -> str:
     """Return the per-user app data directory, creating it if needed."""
-    root = os.environ.get("APPDATA") or os.path.expanduser("~")
-    path = os.path.join(root, APP_NAME)
-    os.makedirs(path, exist_ok=True)
-    return path
+    return app_support_dir(APP_NAME)
 
 
 def get_data_dir() -> str:

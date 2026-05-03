@@ -3,7 +3,7 @@
 # =============================================================================
 # Install with:  pip install -r requirements.txt
 #
-# IMPORTANT: PyTorch must be installed FIRST with CUDA support.
+# IMPORTANT on Windows/NVIDIA: PyTorch should be installed FIRST with CUDA support.
 # Run this command before pip install -r requirements.txt:
 #
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
@@ -12,7 +12,7 @@
 
 # --- Core Whisper Engine (CTranslate2-based, 4-8x faster than openai-whisper) ---
 faster-whisper>=1.1.0
-nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/NeMo.git@main
+nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/NeMo.git@main; sys_platform != "darwin"
 
 # --- Audio Capture & Processing ---
 sounddevice>=0.5.1
@@ -23,17 +23,18 @@ mss>=9.0.1
 Pillow>=10.4.0
 pytesseract>=0.3.13
 
-# --- Windows System Integration ---
-pywin32>=306
-keyboard>=0.13.5
+# --- Native System Integration ---
+pywin32>=306; sys_platform == "win32"
+keyboard>=0.13.5; sys_platform != "darwin"
+pynput>=1.7.7; sys_platform == "darwin"
 pyperclip>=1.8.2
 keyring>=24.0.0
-pycaw>=20240210
+pycaw>=20240210; sys_platform == "win32"
 
 # --- UI / Overlay ---
 PyQt6>=6.7.0
 PyQt6-WebEngine>=6.7.0
 pyqtgraph>=0.13.7
 
-# --- Terminal Output (colored text on Windows) ---
+# --- Terminal Output ---
 colorama>=0.4.6

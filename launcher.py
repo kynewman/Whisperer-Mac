@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import os
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 
 
@@ -37,7 +40,11 @@ _prefer_external_python_packages_for_installed_source()
 def _external_python() -> str | None:
     candidates = [
         os.environ.get("WHISPERER_PYTHON"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", "Python310", "python.exe"),
+        sys.executable if not getattr(sys, "frozen", False) else "",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", "Python310", "python.exe")
+        if os.name == "nt"
+        else "",
+        shutil.which("python3"),
         shutil.which("python"),
     ]
     for candidate in candidates:
@@ -48,6 +55,8 @@ def _external_python() -> str | None:
 
 def _handoff_frozen_ui_to_python() -> bool:
     if not getattr(sys, "frozen", False):
+        return False
+    if sys.platform == "darwin":
         return False
     if os.environ.get("WHISPERER_FORCE_FROZEN_UI") == "1":
         return False
@@ -111,8 +120,17 @@ if getattr(sys, "frozen", False):
         os.environ["QTWEBENGINE_LOCALES_PATH"] = webengine_locales
 
 if "--engine" in sys.argv:
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) and sys.platform != "darwin":
         raise SystemExit("Frozen engine mode is disabled. The installed app launches the engine with system Python.")
+    if sys.platform == "darwin":
+        os.environ.setdefault("WHISPERER_ENGINE_ACCESSORY", "1")
+        os.environ.setdefault("QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM", "1")
+        try:
+            from ui.macos_glass import set_macos_app_activation_policy
+
+            set_macos_app_activation_policy(accessory=True)
+        except Exception:
+            pass
     import importlib
 
     args = [arg for arg in sys.argv[1:] if arg != "--engine"]
@@ -163,41 +181,63 @@ if any(arg.startswith("--file=") for arg in sys.argv[1:]):
         sys.exit(1)
     sys.exit(0)
 
-# QWebEngine/Chromium can crash or paint blank on some Windows DirectComposition
-# paths. Keep that specific guard, but avoid the heavy all-software compositor
-# path unless explicitly requested because it makes scrolling and page changes
-# feel sluggish.
-_disabled_webengine_features = ["DCompPresenter"]
-_webengine_flags = "--disable-direct-composition"
-if os.environ.get("WHISPERER_SAFE_WEBENGINE") == "1":
-    os.environ.setdefault("QT_OPENGL", "software")
-    os.environ.setdefault("QT_QUICK_BACKEND", "software")
-    os.environ.setdefault("QSG_RHI_BACKEND", "software")
-    os.environ.setdefault("QSG_RENDER_LOOP", "basic")
-    _disabled_webengine_features.extend(["UseSkiaRenderer", "VizDisplayCompositor"])
-    _webengine_flags += (
-        " --disable-gpu"
-        " --disable-gpu-compositing"
-    )
-_webengine_flags += f" --disable-features={','.join(_disabled_webengine_features)}"
-if os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"):
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{os.environ['QTWEBENGINE_CHROMIUM_FLAGS']} {_webengine_flags}"
-else:
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _webengine_flags
+if os.name == "nt":
+    # QWebEngine/Chromium can crash or paint blank on some Windows
+    # DirectComposition paths. Keep that specific guard off macOS.
+    _disabled_webengine_features = ["DCompPresenter"]
+    _webengine_flags = "--disable-direct-composition"
+    if os.environ.get("WHISPERER_SAFE_WEBENGINE") == "1":
+        os.environ.setdefault("QT_OPENGL", "software")
+        os.environ.setdefault("QT_QUICK_BACKEND", "software")
+        os.environ.setdefault("QSG_RHI_BACKEND", "software")
+        os.environ.setdefault("QSG_RENDER_LOOP", "basic")
+        _disabled_webengine_features.extend(["UseSkiaRenderer", "VizDisplayCompositor"])
+        _webengine_flags += (
+            " --disable-gpu"
+            " --disable-gpu-compositing"
+        )
+    _webengine_flags += f" --disable-features={','.join(_disabled_webengine_features)}"
+    if os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"):
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{os.environ['QTWEBENGINE_CHROMIUM_FLAGS']} {_webengine_flags}"
+    else:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _webengine_flags
 
-from PyQt6.QtCore import Qt, QCoreApplication
+from PyQt6.QtCore import QEvent, QObject, Qt, QCoreApplication, QTimer
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 import PyQt6.QtWebEngineWidgets  # noqa: F401  must precede QApplication for Qt WebEngine
 
 from core.single_instance import acquire as acquire_single_instance
+from core.paths import get_app_data_dir
 from ui.app_icon import APP_USER_MODEL_ID, app_icon_path
 from ui.fonts import san_francisco, san_francisco_family
 from ui.main_window import MainWindow
 
 
+def _request_existing_ui_window() -> None:
+    """Ask an already-running UI process to restore its main window."""
+    try:
+        request_path = os.path.join(get_app_data_dir(), "show-window.request")
+        with open(request_path, "w", encoding="utf-8") as request_file:
+            request_file.write(f"{os.getpid()} {time.time()}\n")
+    except Exception:
+        pass
+
+
 def _show_existing_ui_window() -> bool:
+    _request_existing_ui_window()
+    if sys.platform == "darwin":
+        try:
+            subprocess.Popen(
+                ["open", "-b", "com.whisperer.app"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:
+            return False
+
     if os.name != "nt":
         return False
     try:
@@ -248,9 +288,38 @@ def _show_existing_ui_window() -> bool:
         return False
 
 
+class _MacReopenFilter(QObject):
+    """Restore the main window when macOS reactivates an already-running app."""
+
+    def __init__(self, window: MainWindow):
+        super().__init__(window)
+        self._window = window
+        self._restore_pending = False
+
+    def restore_if_needed(self):
+        if sys.platform != "darwin" or self._restore_pending:
+            return
+        if self._window.isVisible() and not self._window.isMinimized():
+            return
+        self._restore_pending = True
+
+        def restore():
+            self._restore_pending = False
+            self._window.show_window()
+
+        QTimer.singleShot(0, restore)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Quit:
+            self._window.prepare_for_quit()
+        if event.type() in (QEvent.Type.ApplicationActivate, QEvent.Type.FileOpen):
+            self.restore_if_needed()
+        return False
+
+
 if __name__ == "__main__":
     try:
-        if not acquire_single_instance("WhispererWindowsUI"):
+        if not acquire_single_instance("WhispererUI"):
             _show_existing_ui_window()
             sys.exit(0)
         if os.name == "nt":
@@ -268,6 +337,18 @@ if __name__ == "__main__":
         app.setStyleSheet(f"* {{ font-family: '{san_francisco_family()}'; }}")
         window = MainWindow()
         window.setWindowIcon(icon)
+        if sys.platform == "darwin":
+            reopen_filter = _MacReopenFilter(window)
+            app.installEventFilter(reopen_filter)
+            app.applicationStateChanged.connect(
+                lambda state: (
+                    reopen_filter.restore_if_needed()
+                    if state == Qt.ApplicationState.ApplicationActive
+                    else None
+                )
+            )
+            app._whisperer_reopen_filter = reopen_filter
+        app.aboutToQuit.connect(window.prepare_for_quit)
         window.show()
         sys.exit(app.exec())
     except Exception:

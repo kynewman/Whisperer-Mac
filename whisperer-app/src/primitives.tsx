@@ -219,7 +219,7 @@ export const Toggle = ({
 };
 
 // ─── Select ──────────────────────────────────────────────────────────────────
-export type SelectOption = string | { value: string; label: string; hint?: string };
+export type SelectOption = string | { value: string; label: string; hint?: string; divider?: boolean; disabled?: boolean };
 
 export const Select = ({
   value,
@@ -250,11 +250,11 @@ export const Select = ({
     [options]
   );
   const current = useMemo(
-    () => normalized.find((o) => o.value === value) || normalized[0],
+    () => normalized.find((o) => !o.divider && o.value === value) || normalized.find((o) => !o.divider),
     [normalized, value]
   );
   const currentLabel = current?.label || "";
-  const shortLabel = currentLabel.length > 32 ? currentLabel.slice(0, 30) + "..." : currentLabel;
+  const shortLabel = currentLabel.length > 44 ? currentLabel.slice(0, 42) + "..." : currentLabel;
   return (
     <div ref={ref} style={{ position: "relative", display: "inline-flex", width }} data-no-drag>
       <button
@@ -299,12 +299,26 @@ export const Select = ({
           }}
         >
           {normalized.map((o) => {
+            if (o.divider) {
+              return (
+                <div
+                  key={o.value}
+                  role="separator"
+                  style={{
+                    height: 1,
+                    margin: "5px 6px",
+                    background: "var(--line)",
+                  }}
+                />
+              );
+            }
             const active = o.value === value;
             return (
               <button
                 key={o.value}
                 type="button"
                 onClick={() => {
+                  if (o.disabled) return;
                   onChange(o.value);
                   setOpen(false);
                 }}
@@ -317,9 +331,10 @@ export const Select = ({
                   background: active ? "var(--menu-active)" : "transparent",
                   border: "none",
                   borderRadius: 8,
-                  cursor: "pointer",
+                  cursor: o.disabled ? "not-allowed" : "pointer",
                   fontFamily: "inherit",
                   textAlign: "left",
+                  opacity: o.disabled ? 0.5 : 1,
                 }}
               >
                 <span style={{ width: 14, display: "grid", placeItems: "center", color: active ? "var(--accent)" : "transparent" }}>

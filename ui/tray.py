@@ -1,5 +1,7 @@
 """System tray icon and menu for Whisperer."""
 
+from __future__ import annotations
+
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QAction, QIcon, QPainter, QColor, QPixmap
 from PyQt6.QtWidgets import QSystemTrayIcon, QMenu, QWidget

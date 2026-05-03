@@ -2,7 +2,7 @@
 =============================================================================
   Whisper Project  —  Main Entry Point
 =============================================================================
-  A local, high-performance speech-to-text app for Windows.
+  A local, high-performance speech-to-text app for macOS and Windows.
 
   Usage:
       python main.py
@@ -67,7 +67,6 @@ _EARLY_MODEL_NAME = next(
 if _EARLY_MODEL_NAME.lower().startswith("nvidia/parakeet"):
     import torch  # must be imported before PyQt6 to avoid c10.dll crash on Windows for NeMo/PyTorch
 import numpy as np
-import keyboard
 
 from PyQt6.QtCore import QTimer, pyqtSignal, QObject
 from PyQt6.QtWidgets import QApplication
@@ -87,10 +86,11 @@ from core.context import (
 from core.formatter import format_transcription
 from core.dictionary import add_words_from_list, apply_replacements, get_prompt_words
 from core.term_filter import extract_useful_terms
-from core.modes import resolve_active_mode, list_modes, get_mode_by_name
+from core.modes import resolve_active_mode, list_modes, get_mode_by_name, seed_builtins
 from core.history import save_dictation, save_context
 from core.file_transcriber import transcribe_file
 from core.settings import load_settings
+from core import hotkeys
 from core.output import paste_text
 from core.perf import record_timing, timed
 from core.audio_ducking import AudioDucker
@@ -99,21 +99,34 @@ from ui.overlay import WaveformOverlay
 
 
 def _normalize_keyboard_hotkey(hotkey: str | None) -> str | None:
-    """Convert Qt key names into names understood by the keyboard package."""
-    if not hotkey:
-        return hotkey
+    """Convert UI key names into names understood by the native hotkey backend."""
+    return hotkeys.normalize_hotkey(hotkey)
 
-    parts = []
-    for part in hotkey.split("+"):
-        key = part.strip().lower()
-        if key in {"meta", "win", "windows"}:
-            key = "left windows"
-        elif key == "control":
-            key = "ctrl"
-        elif key == "esc":
-            key = "escape"
-        parts.append(key)
-    return "+".join(parts)
+
+STT_KEY_SERVICES = {
+    "openai_whisper": "openai",
+    "groq_whisper": "groq",
+    "deepgram": "deepgram",
+    "openai_compatible_stt": "openai_compat_stt",
+    "nvidia_nim_parakeet": "nvidia",
+}
+
+STT_DEFAULT_MODELS = {
+    "local": lambda: config.WHISPER_MODEL_SIZE,
+    "openai_whisper": lambda: "gpt-4o-transcribe",
+    "groq_whisper": lambda: "whisper-large-v3-turbo",
+    "deepgram": lambda: "nova-3",
+    "openai_compatible_stt": lambda: "whisper-large-v3",
+    "nvidia_nim_parakeet": lambda: "parakeet-1.1b-rnnt-multilingual",
+}
+
+
+def _stt_model_name(provider: str, override: str | None = None) -> str:
+    override = (override or "").strip()
+    if override:
+        return override
+    default = STT_DEFAULT_MODELS.get(provider)
+    return default() if default else config.WHISPER_MODEL_SIZE
 
 
 def _write_engine_ready_file(model_name: str) -> None:
@@ -145,9 +158,9 @@ except Exception:
     _VOSK_AVAILABLE = False
 
 ENGINE_FORCE_STOP_RESTART_CODE = 42
-LONGFORM_POLL_INTERVAL_S = 0.006
-LONGFORM_RELEASE_DEBOUNCE_S = 0.035
-LONGFORM_LOCK_GRACE_S = 0.14
+LONGFORM_POLL_INTERVAL_S = 0.004
+LONGFORM_RELEASE_DEBOUNCE_S = 0.012
+LONGFORM_LOCK_GRACE_S = 0.0
 LONGFORM_STOP_ARM_DEBOUNCE_S = 0.06
 LOADING_PREVIEW_HIDE_S = 1.4
 
@@ -166,6 +179,7 @@ class Signals(QObject):
     show_overlay = pyqtSignal()
     show_model_loading = pyqtSignal()
     hide_overlay = pyqtSignal()
+    hide_overlay_now = pyqtSignal()
     set_active = pyqtSignal(bool)
     set_status = pyqtSignal(str)
     set_transcribed_text = pyqtSignal(str)
@@ -184,9 +198,31 @@ class WhisperApp:
     """
 
     def __init__(self):
-        if not acquire_single_instance("WhispererWindowsEngine"):
+        if not acquire_single_instance("WhispererEngine"):
+            print("ENGINE_ALREADY_RUNNING", flush=True)
             raise SystemExit(0)
+        mac_engine_accessory = (
+            sys.platform == "darwin"
+            and (
+                os.environ.get("WHISPERER_ENGINE_PARENT_UI") == "1"
+                or os.environ.get("WHISPERER_ENGINE_ACCESSORY") == "1"
+            )
+        )
+        if mac_engine_accessory:
+            try:
+                from ui.macos_glass import set_macos_app_activation_policy
+
+                set_macos_app_activation_policy(accessory=True)
+            except Exception:
+                pass
         self.app = QApplication(sys.argv)
+        if mac_engine_accessory:
+            try:
+                from ui.macos_glass import set_macos_app_activation_policy
+
+                set_macos_app_activation_policy(accessory=True)
+            except Exception:
+                pass
         self.overlay = WaveformOverlay()
         self.signals = Signals()
         self._context_words = ""
@@ -212,6 +248,7 @@ class WhisperApp:
         self._registered_hotkeys: list = []
         self._modes_list: list = []
         self._current_mode_index = 0
+        seed_builtins()
         self._refresh_modes_list()
 
         # Word dictionary tracking
@@ -227,6 +264,7 @@ class WhisperApp:
         self.signals.show_overlay.connect(self.overlay.fade_in)
         self.signals.show_model_loading.connect(self.overlay.show_model_loading)
         self.signals.hide_overlay.connect(self.overlay.fade_out)
+        self.signals.hide_overlay_now.connect(self.overlay.hide_now)
         self.signals.set_active.connect(self.overlay.set_active)
         self.signals.set_status.connect(self.overlay.set_status)
         self.signals.set_transcribed_text.connect(self.overlay.append_transcribed_text)
@@ -304,7 +342,10 @@ class WhisperApp:
         if longform_requested:
             self._request_longform_lock()
         threading.Thread(
-            target=lambda: self._run_one_dictation_session(lock_acquired=True, overlay_primed=True),
+            target=lambda: self._run_one_dictation_session(
+                lock_acquired=True,
+                overlay_primed=True,
+            ),
             daemon=True,
         ).start()
         return True
@@ -376,6 +417,39 @@ class WhisperApp:
         if not self._modes_list:
             self._modes_list = [get_mode_by_name("Voice") or resolve_active_mode()]
 
+    def _capture_active_target(self) -> tuple[str, str]:
+        try:
+            return get_active_window_name(), get_active_window_title()
+        except Exception:
+            return "", ""
+
+    def _begin_active_target_capture(self) -> tuple[dict[str, str], threading.Thread]:
+        result = {"active_app": "", "window_title": ""}
+
+        def _capture():
+            active_app, window_title = self._capture_active_target()
+            result["active_app"] = active_app
+            result["window_title"] = window_title
+
+        thread = threading.Thread(target=_capture, daemon=True)
+        thread.start()
+        return result, thread
+
+    def _finish_active_target_capture(
+        self,
+        result: dict[str, str] | None,
+        thread: threading.Thread | None,
+        *,
+        timeout: float = 0.25,
+    ) -> tuple[str, str]:
+        if thread is not None:
+            thread.join(timeout=timeout)
+        active_app = (result or {}).get("active_app", "")
+        window_title = (result or {}).get("window_title", "")
+        if active_app or window_title:
+            return active_app, window_title
+        return self._capture_active_target()
+
     def _on_mode_changed_overlay(self, mode_name: str):
         """Show a brief mode-change notification in the overlay."""
         self.overlay.set_mode(mode_name)
@@ -384,6 +458,18 @@ class WhisperApp:
         QTimer.singleShot(1200, self.signals.hide_overlay.emit)
 
     def _on_overlay_open_ui(self):
+        print("OPEN_UI_REQUESTED", flush=True)
+        if os.environ.get("WHISPERER_ENGINE_PARENT_UI") == "1":
+            if sys.platform == "darwin":
+                try:
+                    subprocess.Popen(
+                        ["open", "-b", "com.whisperer.app"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+            return
         if self._show_launcher_window():
             return
         try:
@@ -391,12 +477,14 @@ class WhisperApp:
             subprocess.Popen(
                 [sys.executable, launcher_path],
                 cwd=config.PROJECT_ROOT,
-                creationflags=0x08000000,
+                creationflags=0x08000000 if os.name == "nt" else 0,
             )
         except Exception:
             pass
 
     def _show_launcher_window(self) -> bool:
+        if os.name != "nt":
+            return False
         try:
             import ctypes
             from ctypes import wintypes
@@ -448,12 +536,17 @@ class WhisperApp:
             return False
 
     def _on_overlay_force_stop(self):
+        print("STOP_DICTATION_REQUESTED", flush=True)
         self._cancelled = True
+        self._clear_longform_lock()
+        self.signals.set_locked.emit(False)
+        self.signals.set_active.emit(False)
         if self.recorder.is_recording:
             self.signals.set_status.emit("Stopping...")
             return
         if self._processing_job_active.is_set() or self._session_lock.locked():
-            os._exit(ENGINE_FORCE_STOP_RESTART_CODE)
+            self.signals.set_status.emit("Stopping...")
+            return
         self.signals.set_processing.emit(False)
         self.signals.hide_overlay.emit()
 
@@ -461,11 +554,11 @@ class WhisperApp:
         print("DICTATION_STARTED", flush=True)
         self.signals.set_model_loading.emit(False)
         self.signals.set_processing.emit(False)
+        self.signals.show_overlay.emit()
         if not self._longform_requested.is_set():
             self.signals.set_locked.emit(False)
         self.signals.set_active.emit(True)
         self.signals.set_status.emit("Listening...")
-        self.signals.show_overlay.emit()
 
     def _request_longform_lock(self):
         self._longform_requested.set()
@@ -481,7 +574,7 @@ class WhisperApp:
 
     def _is_dictation_hotkey_pressed(self, dictation_hk: str) -> bool:
         try:
-            if keyboard.is_pressed(dictation_hk):
+            if hotkeys.is_pressed(dictation_hk):
                 return True
         except Exception:
             pass
@@ -489,7 +582,7 @@ class WhisperApp:
         if not parts:
             return False
         try:
-            return all(keyboard.is_pressed(part) for part in parts)
+            return all(hotkeys.is_pressed(part) for part in parts)
         except Exception:
             return False
 
@@ -501,7 +594,7 @@ class WhisperApp:
         Poll while the hotkey is held. Returns True for longform, False for quick mode,
         None if cancelled.
         """
-        time.sleep(0.015)
+        time.sleep(0.002)
         release_seen_at: float | None = None
         release_grace_until: float | None = None
         while True:
@@ -515,7 +608,7 @@ class WhisperApp:
                 release_grace_until = None
                 time.sleep(LONGFORM_POLL_INTERVAL_S)
             else:
-                now = time.time()
+                now = time.monotonic()
                 if release_seen_at is None:
                     release_seen_at = now
                     release_grace_until = now + LONGFORM_LOCK_GRACE_S
@@ -533,7 +626,7 @@ class WhisperApp:
     def _is_alt_pressed(self) -> bool:
         for key in ("alt", "left alt", "right alt", "menu"):
             try:
-                if keyboard.is_pressed(key):
+                if hotkeys.is_pressed(key):
                     return True
             except Exception:
                 continue
@@ -646,6 +739,7 @@ class WhisperApp:
         audio_path: str | None = None,
         error: str | None = None,
         stt_provider: str = "local",
+        stt_model: str | None = None,
         llm_processed: int = 0,
         paste_method: str = "clipboard_paste",
         paste_succeeded: int = 0,
@@ -661,7 +755,7 @@ class WhisperApp:
                 window_title=window_title,
                 mode_id=mode_id,
                 stt_provider=stt_provider,
-                stt_model=config.WHISPER_MODEL_SIZE,
+                stt_model=stt_model or _stt_model_name(stt_provider),
                 raw_transcript=raw_text,
                 final_text=final_text,
                 replacements_applied=1,
@@ -716,6 +810,8 @@ class WhisperApp:
         toggle_mode: bool = False,
         lock_acquired: bool = False,
         overlay_primed: bool = False,
+        initial_active_app: str = "",
+        initial_window_title: str = "",
     ):
         """Run a single dictation: show overlay, record, transcribe, paste. Runs in a background thread."""
         acquired_lock = lock_acquired
@@ -729,24 +825,23 @@ class WhisperApp:
         self._toggle_mode = toggle_mode
         started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         t0 = time.time()
-        active_app = ""
-        window_title = ""
+        active_app = initial_active_app or ""
+        window_title = initial_window_title or ""
         mode_id = None
         mode = None
         contexts: dict[str, str] = {}
         stt_provider = "local"
+        stt_model = _stt_model_name(stt_provider)
+        active_capture: dict[str, str] | None = None
+        active_capture_thread: threading.Thread | None = None
 
         try:
             if not self._running:
                 return
-            try:
-                active_app = get_active_window_name()
-                window_title = get_active_window_title()
-            except Exception:
-                active_app = ""
-                window_title = ""
             if not overlay_primed:
                 self._prime_listening_overlay()
+            if not active_app and not window_title:
+                active_capture, active_capture_thread = self._begin_active_target_capture()
 
             try:
                 with timed("recorder_start"):
@@ -797,6 +892,11 @@ class WhisperApp:
                     self.signals.set_status.emit("Long-form mode  —  Press dictation hotkey to finish")
                     self._wait_for_longform_stop(dictation_hk)
 
+            self.signals.set_active.emit(False)
+            self.signals.set_locked.emit(False)
+            self.signals.set_status.emit("Transcribing...")
+            self.signals.set_processing.emit(True)
+
             if self._cancelled:
                 with timed("recorder_stop_cancelled"):
                     audio = self.recorder.stop()
@@ -827,14 +927,18 @@ class WhisperApp:
             duration_ms = int((time.time() - t0) * 1000)
 
             if len(audio) < config.AUDIO_SAMPLE_RATE * 0.3 or _looks_silent(audio):
+                self.signals.set_processing.emit(False)
+                self.signals.set_status.emit("No speech detected.")
+                time.sleep(0.3)
                 self.signals.hide_overlay.emit()
                 return
 
             self._processing_job_active.set()
-            self.signals.set_active.emit(False)
-            self.signals.set_locked.emit(False)
-            self.signals.set_processing.emit(True)
-            self.signals.set_status.emit("Processing...")
+            if not active_app and not window_title:
+                active_app, window_title = self._finish_active_target_capture(
+                    active_capture,
+                    active_capture_thread,
+                )
 
             try:
                 mode = resolve_active_mode(active_app, window_title)
@@ -843,6 +947,7 @@ class WhisperApp:
             mode_id = mode.id
             self.signals.set_mode.emit(mode.name)
             stt_provider = mode.stt_provider or "local"
+            stt_model = _stt_model_name(stt_provider, mode.stt_model)
             settings = load_settings()
             perf_cfg = settings.get("performance", {})
             context_mode = str(perf_cfg.get("context_mode", "fast")).lower()
@@ -910,29 +1015,58 @@ class WhisperApp:
                 prompt_parts.append(f"Selected text:\n{contexts['selected_text']}")
             prompt_text = "\n\n".join(prompt_parts) if prompt_parts else None
 
+            def _local_transcribe() -> str:
+                return transcribe(
+                    audio,
+                    context_words=vocab_hints,
+                    selected_text=contexts.get("selected_text", ""),
+                    clipboard_context=contexts.get("clipboard", ""),
+                    ui_automation_text=contexts.get("ui_automation", ""),
+                )
+
             raw_text = ""
             try:
-                if stt_provider == "local":
-                    with timed("dictation_transcribe_total"):
-                        raw_text = transcribe(
-                            audio,
-                            context_words=vocab_hints,
-                            selected_text=contexts.get("selected_text", ""),
-                            clipboard_context=contexts.get("clipboard", ""),
-                            ui_automation_text=contexts.get("ui_automation", ""),
-                        )
-                else:
-                    # Cloud STT
-                    self.signals.set_status.emit("Cloud transcribing...")
-                    from core.transcriber import transcribe_cloud
-                    from core.secrets import get_key
-                    key = get_key(stt_provider.replace("_whisper", ""))
-                    if not key and stt_provider == "groq_whisper":
-                        key = get_key("groq")
-                    if not key:
-                        raise RuntimeError(f"No API key configured for {stt_provider}")
-                    with timed("dictation_transcribe_total"):
-                        raw_text = transcribe_cloud(audio, stt_provider, key, language=config.WHISPER_LANGUAGE, prompt=prompt_text)
+                with timed("dictation_transcribe_total"):
+                    if stt_provider == "local":
+                        raw_text = _local_transcribe()
+                    else:
+                        # Cloud STT; fall back locally so a missing key or transient
+                        # provider error does not drop the dictation.
+                        self.signals.set_status.emit("Cloud transcribing...")
+                        from core.transcriber import transcribe_cloud
+                        from core.secrets import get_key
+                        service = STT_KEY_SERVICES.get(stt_provider, stt_provider.replace("_whisper", ""))
+                        key = get_key(service)
+                        if not key and stt_provider == "groq_whisper":
+                            key = get_key("groq")
+                        compat_base_url = ""
+                        if stt_provider == "openai_compatible_stt":
+                            compat_base_url = settings.get("stt", {}).get("openai_compat_url", "")
+                        elif stt_provider == "nvidia_nim_parakeet":
+                            compat_base_url = settings.get("stt", {}).get("nvidia_nim_url", "")
+                        if not key and stt_provider not in ("openai_compatible_stt", "nvidia_nim_parakeet"):
+                            self.signals.set_status.emit("No cloud key. Using local model...")
+                            stt_provider = "local"
+                            stt_model = _stt_model_name(stt_provider)
+                            raw_text = _local_transcribe()
+                        else:
+                            try:
+                                with timed("dictation_cloud_request"):
+                                    raw_text = transcribe_cloud(
+                                        audio,
+                                        stt_provider,
+                                        key,
+                                        language=mode.language or config.WHISPER_LANGUAGE,
+                                        prompt=prompt_text,
+                                        model=stt_model,
+                                        base_url=compat_base_url,
+                                    )
+                            except Exception as cloud_exc:
+                                print(f"Cloud STT failed for {stt_provider}: {cloud_exc}", flush=True)
+                                self.signals.set_status.emit("Cloud failed. Using local model...")
+                                stt_provider = "local"
+                                stt_model = _stt_model_name(stt_provider)
+                                raw_text = _local_transcribe()
             except Exception as exc:
                 self.signals.set_processing.emit(False)
                 self.signals.set_status.emit(f"Error: {exc}")
@@ -941,7 +1075,7 @@ class WhisperApp:
                 threading.Thread(
                     target=self._save_dictation_background,
                     args=(started_at, duration_ms, active_app, window_title, mode_id, "", ""),
-                    kwargs={"contexts": contexts, "error": str(exc), "stt_provider": stt_provider},
+                    kwargs={"contexts": contexts, "error": str(exc), "stt_provider": stt_provider, "stt_model": stt_model},
                     daemon=True,
                 ).start()
                 return
@@ -958,7 +1092,7 @@ class WhisperApp:
                 threading.Thread(
                     target=self._save_dictation_background,
                     args=(started_at, duration_ms, active_app, window_title, mode_id, "", ""),
-                    kwargs={"contexts": contexts, "error": "No speech detected", "stt_provider": stt_provider},
+                    kwargs={"contexts": contexts, "error": "No speech detected", "stt_provider": stt_provider, "stt_model": stt_model},
                     daemon=True,
                 ).start()
                 return
@@ -1066,6 +1200,7 @@ class WhisperApp:
                     "contexts": contexts,
                     "audio_path": audio_path,
                     "stt_provider": stt_provider,
+                    "stt_model": stt_model,
                     "llm_processed": llm_processed,
                     "paste_method": paste_method,
                     "paste_succeeded": paste_succeeded,
@@ -1094,7 +1229,10 @@ class WhisperApp:
         if self._is_alt_pressed():
             self._request_longform_lock()
         threading.Thread(
-            target=lambda: self._run_one_dictation_session(lock_acquired=True, overlay_primed=True),
+            target=lambda: self._run_one_dictation_session(
+                lock_acquired=True,
+                overlay_primed=True,
+            ),
             daemon=True,
         ).start()
 
@@ -1199,7 +1337,7 @@ class WhisperApp:
         """Remove all registered keyboard hotkeys."""
         for hk in self._registered_hotkeys:
             try:
-                keyboard.remove_hotkey(hk)
+                hotkeys.remove_hotkey(hk)
             except Exception:
                 pass
         self._registered_hotkeys.clear()
@@ -1215,7 +1353,7 @@ class WhisperApp:
             if not hotkey_str:
                 return
             try:
-                hk = keyboard.add_hotkey(hotkey_str, callback, suppress=False)
+                hk = hotkeys.add_hotkey(hotkey_str, callback, suppress=False)
                 self._registered_hotkeys.append(hk)
                 print(f"Registered hotkey: {hotkey_str}", flush=True)
             except Exception as exc:
@@ -1235,7 +1373,8 @@ class WhisperApp:
         record_timing("engine_import_phase", (time.perf_counter() - _PROCESS_START) * 1000.0)
         model_name = config.WHISPER_MODEL_SIZE
         engine_name = "NVIDIA Parakeet" if model_name.lower().startswith("nvidia/parakeet") else "Whisper"
-        print(f"Loading {engine_name} model onto GPU...", flush=True)
+        target = "GPU" if config.WHISPER_DEVICE == "cuda" else config.WHISPER_DEVICE.upper()
+        print(f"Loading {engine_name} model on {target}...", flush=True)
 
         try:
             with timed("engine_startup_model_phase"):
