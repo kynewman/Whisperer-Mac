@@ -13,6 +13,8 @@
 # --- Core Whisper Engine (CTranslate2-based, 4-8x faster than openai-whisper) ---
 faster-whisper>=1.1.0
 nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/NeMo.git@main; sys_platform != "darwin"
+nvidia-riva-client>=2.19.0
+grpcio>=1.62.0
 
 # --- Audio Capture & Processing ---
 sounddevice>=0.5.1

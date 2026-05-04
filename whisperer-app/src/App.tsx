@@ -35,6 +35,19 @@ export type DictationBackup = {
   durationSeconds?: number;
   modifiedAt?: string;
 };
+export type UpdateStatus = {
+  state: "idle" | "checking" | "up_to_date" | "available" | "error" | "installing";
+  busy: boolean;
+  message: string;
+  currentVersion: string;
+  latestVersion?: string;
+  latestTag?: string;
+  checkedAt?: string;
+  releaseUrl?: string;
+  assetName?: string;
+  assetUrl?: string;
+  updateAvailable: boolean;
+};
 export type VocabularySnapshot = {
   wordCount: number;
   words: Array<{ word: string; count: number; source?: string; last_seen?: string }>;
@@ -110,6 +123,7 @@ export interface AppSnapshot {
   shortcuts?: Record<string, string[]>;
   micLevel?: MicLevel;
   dictationBackup?: DictationBackup;
+  updateStatus?: UpdateStatus;
   apiKeys?: Record<string, boolean>;
   vocabulary?: VocabularySnapshot;
   history?: HistorySnapshot;
@@ -129,11 +143,22 @@ const DEFAULT_MODELS: BridgeOption[] = [
   { value: "large-v3", label: "Whisper Large v3" },
 ];
 
-const DEFAULT_GPUS: BridgeOption[] = [{ value: "auto", label: "Auto (Apple Silicon / CPU)" }];
+const DEFAULT_GPUS: BridgeOption[] = [
+  { value: "auto", label: "Auto (Apple Silicon / CPU)" },
+  { value: "__cloud_runtime_divider__", label: "", divider: true },
+  { value: "nvidia_nim_api", label: "NVIDIA Parakeet API", hint: "Cloud" },
+];
 const DEFAULT_MICROPHONES: MicOption[] = [{ value: "default", label: "System default microphone", hint: "Auto" }];
 const DEFAULT_CHANNELS: BridgeOption[] = [{ value: "0", label: "Channel 1" }];
 const DEFAULT_MIC_LEVEL: MicLevel = { db: -96, level: 0 };
 const DEFAULT_DICTATION_BACKUP: DictationBackup = { available: false, busy: false };
+const DEFAULT_UPDATE_STATUS: UpdateStatus = {
+  state: "idle",
+  busy: false,
+  message: "Updates have not been checked yet.",
+  currentVersion: "",
+  updateAvailable: false,
+};
 const DEFAULT_VOCABULARY: VocabularySnapshot = { wordCount: 0, words: [], rules: [] };
 const DEFAULT_HISTORY: HistorySnapshot = { items: [], totals: { today: 0, words: 0, minutes: 0 } };
 const DEFAULT_MODES: ModeItem[] = [];
@@ -262,6 +287,7 @@ export default function App() {
   const [shortcuts, setShortcuts] = useState<Record<string, string[]>>({ dictation: ["Ctrl", "Cmd"] });
   const [micLevel, setMicLevel] = useState<MicLevel>(DEFAULT_MIC_LEVEL);
   const [dictationBackup, setDictationBackup] = useState<DictationBackup>(DEFAULT_DICTATION_BACKUP);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(DEFAULT_UPDATE_STATUS);
   const [apiKeys, setApiKeys] = useState<Record<string, boolean>>({});
   const [vocabulary, setVocabulary] = useState<VocabularySnapshot>(DEFAULT_VOCABULARY);
   const [history, setHistory] = useState<HistorySnapshot>(DEFAULT_HISTORY);
@@ -297,6 +323,7 @@ export default function App() {
     if (snapshot.shortcuts) setShortcuts(snapshot.shortcuts);
     if (snapshot.micLevel) setMicLevel(snapshot.micLevel);
     if (snapshot.dictationBackup) setDictationBackup(snapshot.dictationBackup);
+    if (snapshot.updateStatus) setUpdateStatus(snapshot.updateStatus);
     if (snapshot.apiKeys) setApiKeys(snapshot.apiKeys);
     if (snapshot.vocabulary) setVocabulary(snapshot.vocabulary);
     if (snapshot.history) setHistory(snapshot.history);
@@ -438,6 +465,14 @@ export default function App() {
     window.whisperer?.transcribeLastDictation?.().then(applySnapshot).catch(() => {});
   }, [applySnapshot]);
 
+  const checkForUpdates = useCallback(() => {
+    window.whisperer?.checkForUpdates?.().then(applySnapshot).catch(() => {});
+  }, [applySnapshot]);
+
+  const installUpdate = useCallback(() => {
+    window.whisperer?.installUpdate?.().then(applySnapshot).catch(() => {});
+  }, [applySnapshot]);
+
   const pageTitle = NAV_ITEMS.find((n) => n.key === activePage)?.label || "";
   const densityScale = tweaks.density === "compact" ? 0.96 : 1;
   const dictationKeys = shortcuts.dictation?.length ? shortcuts.dictation : ["Ctrl", "Cmd"];
@@ -515,10 +550,13 @@ export default function App() {
                 settings={settings}
                 shortcuts={shortcuts}
                 apiKeys={apiKeys}
+                updateStatus={updateStatus}
                 setSetting={setSetting}
                 setShortcut={setShortcut}
                 setApiKey={setApiKey}
                 deleteApiKey={deleteApiKey}
+                checkForUpdates={checkForUpdates}
+                installUpdate={installUpdate}
               />
             )}
             {activePage === "sound" && (

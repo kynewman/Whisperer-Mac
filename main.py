@@ -117,7 +117,7 @@ STT_DEFAULT_MODELS = {
     "groq_whisper": lambda: "whisper-large-v3-turbo",
     "deepgram": lambda: "nova-3",
     "openai_compatible_stt": lambda: "whisper-large-v3",
-    "nvidia_nim_parakeet": lambda: "parakeet-1.1b-rnnt-multilingual",
+    "nvidia_nim_parakeet": lambda: "parakeet-tdt-0.6b-v2",
 }
 
 

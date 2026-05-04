@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Btn, Card, Eyebrow, Icon, Input, KeyCombo, Row, SectionTitle, Select, Toggle } from "../primitives";
 import { SHORTCUTS } from "../data";
-import type { AppSettings, Tweaks } from "../App";
+import type { AppSettings, Tweaks, UpdateStatus } from "../App";
 
 type ProviderKey = {
   service: string;
@@ -85,20 +85,26 @@ export default function ConfigPage({
   settings: appSettings,
   shortcuts,
   apiKeys,
+  updateStatus,
   setSetting,
   setShortcut,
   setApiKey,
   deleteApiKey,
+  checkForUpdates,
+  installUpdate,
 }: {
   tweaks: Tweaks;
   setTweaks: (t: Tweaks) => void;
   settings: AppSettings;
   shortcuts: Record<string, string[]>;
   apiKeys: Record<string, boolean>;
+  updateStatus: UpdateStatus;
   setSetting: (section: string, key: string, value: unknown) => void;
   setShortcut: (name: string, value: string) => void;
   setApiKey: (service: string, value: string) => void;
   deleteApiKey: (service: string) => void;
+  checkForUpdates: () => void;
+  installUpdate: () => void;
 }) {
   const [settings, setSettings] = useState({
     launchOnLogin: Boolean(appSettings.startup?.launch_on_login ?? false),
@@ -221,6 +227,16 @@ export default function ConfigPage({
   const dictationKeys = recordingShortcut
     ? (draftShortcut.length ? draftShortcut : ["Press keys"])
     : (shortcuts.dictation?.length ? shortcuts.dictation : ["Ctrl", "Cmd"]);
+  const updateBusy = Boolean(updateStatus.busy);
+  const updateMessage = updateStatus.message || "Updates have not been checked yet.";
+  const updateMeta = updateStatus.latestVersion
+    ? `Current ${updateStatus.currentVersion || "-"} - Latest ${updateStatus.latestVersion}`
+    : `Current ${updateStatus.currentVersion || "-"}`;
+  const updateColor =
+    updateStatus.state === "available" ? "var(--accent-ink)" :
+    updateStatus.state === "error" ? "var(--rec)" :
+    updateStatus.state === "up_to_date" ? "var(--ok)" :
+    "var(--ink-3)";
 
   const closePurge = () => {
     setPurgeOpen(false);
@@ -482,6 +498,39 @@ export default function ConfigPage({
 
       <SectionTitle>Startup & updates</SectionTitle>
       <Card style={{ marginBottom: 18 }}>
+        <Row
+          title="Whisperer updates"
+          subtitle={updateMessage}
+          control={
+            <div style={{ display: "grid", justifyItems: "end", gap: 6, maxWidth: 430 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ color: updateColor, fontSize: 11.5, fontWeight: 600 }}>
+                  {updateStatus.state === "checking" ? "Checking" :
+                   updateStatus.state === "installing" ? "Installing" :
+                   updateStatus.state === "available" ? "Update available" :
+                   updateStatus.state === "up_to_date" ? "Up to date" :
+                   updateStatus.state === "error" ? "Check failed" :
+                   "Not checked"}
+                </span>
+                <Btn size="sm" variant="secondary" icon="search" disabled={updateBusy} onClick={checkForUpdates}>
+                  Check
+                </Btn>
+                <Btn
+                  size="sm"
+                  variant="accent"
+                  icon="check"
+                  disabled={updateBusy || !updateStatus.updateAvailable}
+                  onClick={installUpdate}
+                >
+                  Install update
+                </Btn>
+              </div>
+              <span style={{ color: "var(--ink-3)", fontSize: 11.5 }}>
+                {updateMeta}
+              </span>
+            </div>
+          }
+        />
         <Row title="Start Whisperer when macOS starts" subtitle="Add or remove Whisperer from your macOS login items."
              control={<Toggle checked={settings.launchOnLogin} onChange={(v) => set("launchOnLogin", v)} />} />
         <Row title="Start engine when Whisperer opens" subtitle="Warm the transcription engine automatically after launch."

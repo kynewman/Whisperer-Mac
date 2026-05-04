@@ -35,6 +35,8 @@ declare global {
       setApiKey?: (service: string, value: string) => Promise<string>;
       deleteApiKey?: (service: string) => Promise<string>;
       testApiKey?: (service: string) => Promise<string>;
+      checkForUpdates?: () => Promise<string>;
+      installUpdate?: () => Promise<string>;
     };
   }
 }

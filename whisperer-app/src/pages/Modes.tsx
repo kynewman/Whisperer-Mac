@@ -230,7 +230,7 @@ export default function ModesPage({
           <Row
             title="Speech-to-text provider"
             subtitle="The model family used before formatting."
-            control={<Select value={working.stt} onChange={(v) => edit({ stt: v })} options={[{ value: "local", label: "Local" }, { value: "groq_whisper", label: "Groq Fast Cloud" }, { value: "openai_whisper", label: "OpenAI Speech" }, { value: "deepgram", label: "Deepgram Nova" }, { value: "nvidia_nim_parakeet", label: "NVIDIA NIM Parakeet" }, { value: "openai_compatible_stt", label: "OpenAI-compatible STT" }]} width={240} />}
+            control={<Select value={working.stt} onChange={(v) => edit({ stt: v })} options={[{ value: "local", label: "Local" }, { value: "groq_whisper", label: "Groq Fast Cloud" }, { value: "openai_whisper", label: "OpenAI Speech" }, { value: "deepgram", label: "Deepgram Nova" }, { value: "nvidia_nim_parakeet", label: "NVIDIA Parakeet API" }, { value: "openai_compatible_stt", label: "OpenAI-compatible STT" }]} width={240} />}
           />
           <Row title="STT model override" subtitle="Optional provider-specific model name."
                control={<Input value={working.sttModel || ""} onChange={(v) => edit({ sttModel: v } as Partial<ModeItem>)} placeholder="provider default" style={{ width: 260 }} />} />

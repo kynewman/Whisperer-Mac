@@ -18,6 +18,8 @@ APP_ICON = os.path.join(PROJECT_ROOT, "assets", "whisperer.icns")
 FASTER_WHISPER_DATAS = collect_data_files("faster_whisper", includes=["assets/*"])
 FASTER_WHISPER_HIDDEN_IMPORTS = collect_submodules("faster_whisper")
 ONNXRUNTIME_HIDDEN_IMPORTS = collect_submodules("onnxruntime")
+RIVA_HIDDEN_IMPORTS = collect_submodules("riva")
+GRPC_HIDDEN_IMPORTS = collect_submodules("grpc")
 
 
 def collect_source_tree(dirname):
@@ -98,7 +100,9 @@ a = Analysis(
         "mss",
     ]
     + FASTER_WHISPER_HIDDEN_IMPORTS
-    + ONNXRUNTIME_HIDDEN_IMPORTS,
+    + ONNXRUNTIME_HIDDEN_IMPORTS
+    + RIVA_HIDDEN_IMPORTS
+    + GRPC_HIDDEN_IMPORTS,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -197,6 +201,8 @@ app = BUNDLE(
     bundle_identifier="com.whisperer.app",
     info_plist={
         "CFBundleDisplayName": "Whisperer",
+        "CFBundleShortVersionString": "5.5.3",
+        "CFBundleVersion": "5.5.3",
         "CFBundleIconFile": "whisperer.icns",
         "NSMicrophoneUsageDescription": "Whisperer records microphone audio for local dictation.",
         "NSAppleEventsUsageDescription": "Whisperer uses Apple Events to paste dictation and read active-window context.",

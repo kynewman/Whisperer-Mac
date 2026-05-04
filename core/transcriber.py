@@ -31,8 +31,16 @@ _PARAKEET_WARMUP_TRANSCRIBE = os.environ.get("WHISPERER_PARAKEET_WARMUP_TRANSCRI
 DEFAULT_OPENAI_STT_MODEL = "gpt-4o-transcribe"
 DEFAULT_GROQ_STT_MODEL = "whisper-large-v3-turbo"
 DEFAULT_DEEPGRAM_STT_MODEL = "nova-3"
-DEFAULT_NVIDIA_NIM_STT_MODEL = "parakeet-1.1b-rnnt-multilingual"
-API_USER_AGENT = "Whisperer/5.5.2"
+DEFAULT_NVIDIA_NIM_STT_MODEL = "parakeet-tdt-0.6b-v2"
+NVIDIA_HOSTED_RIVA_URI = "grpc.nvcf.nvidia.com:443"
+NVIDIA_NIM_LOCAL_HTTP_URL = "http://localhost:9000/v1/audio/transcriptions"
+NVIDIA_RIVA_FUNCTION_IDS = {
+    "parakeet-tdt-0.6b-v2": "d3fe9151-442b-4204-a70d-5fcc597fd610",
+    "parakeet-ctc-0.6b-asr": "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965",
+    "parakeet-1.1b-rnnt-multilingual-asr": "71203149-d3b7-4460-8231-1be2543a1fca",
+    "parakeet-1.1b-rnnt-multilingual": "71203149-d3b7-4460-8231-1be2543a1fca",
+}
+API_USER_AGENT = "Whisperer/5.5.3"
 
 
 def _quiet_model_telemetry_logs() -> None:
@@ -230,6 +238,12 @@ def _audio_to_wav_bytes(audio: np.ndarray) -> bytes:
         wf.setframerate(16000)
         wf.writeframes(scaled.tobytes())
     return buf.getvalue()
+
+
+def _audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    """Convert float32 mono audio into raw 16-bit PCM for Riva gRPC."""
+    clipped = np.clip(audio.astype(np.float32, copy=False), -1.0, 1.0)
+    return (clipped * 32767).astype(np.int16).tobytes()
 
 
 def _parakeet_text(result) -> str:
@@ -503,6 +517,114 @@ def transcribe_deepgram(audio: np.ndarray, api_key: str, language: str = "en", m
         return result["results"]["channels"][0]["alternatives"][0].get("transcript", "")
 
 
+def _nvidia_model_id(model: str | None) -> str:
+    cleaned = (model or DEFAULT_NVIDIA_NIM_STT_MODEL).strip() or DEFAULT_NVIDIA_NIM_STT_MODEL
+    aliases = {
+        "parakeet-1.1b-rnnt-multilingual": "parakeet-1.1b-rnnt-multilingual-asr",
+    }
+    return aliases.get(cleaned, cleaned)
+
+
+def _nvidia_hosted_uri(base_url: str | None) -> str:
+    raw = (base_url or "").strip()
+    if not raw:
+        return NVIDIA_HOSTED_RIVA_URI
+    parsed = urllib.parse.urlparse(raw)
+    local_hosts = {"localhost:9000", "127.0.0.1:9000"}
+    if parsed.netloc.lower() in local_hosts:
+        return NVIDIA_HOSTED_RIVA_URI
+    if raw.lower().rstrip("/") == NVIDIA_NIM_LOCAL_HTTP_URL.lower().rstrip("/"):
+        return NVIDIA_HOSTED_RIVA_URI
+    if parsed.scheme in {"grpc", "grpcs", "http", "https"}:
+        raw = parsed.netloc or parsed.path
+    return raw.strip().strip("/") or NVIDIA_HOSTED_RIVA_URI
+
+
+def _should_use_nvidia_hosted_api(api_key: str | None, base_url: str | None) -> bool:
+    raw = (base_url or "").strip()
+    lower = raw.lower().rstrip("/")
+    if lower.startswith(("grpc://", "grpcs://")) or "grpc.nvcf.nvidia.com" in lower:
+        return True
+    if not api_key:
+        return False
+    return lower in {
+        "",
+        NVIDIA_NIM_LOCAL_HTTP_URL.lower().rstrip("/"),
+        "http://localhost:9000/v1/audio/transcriptions",
+        "http://127.0.0.1:9000/v1/audio/transcriptions",
+    }
+
+
+def _nvidia_language_code(language: str | None, model: str) -> str:
+    value = (language or "").strip()
+    if not value or value.lower() in {"auto", "multi"}:
+        return "en-US" if "multilingual" not in model else ""
+    if value.lower() == "en":
+        return "en-US"
+    return value
+
+
+def _riva_response_text(response) -> str:
+    parts: list[str] = []
+    for result in getattr(response, "results", []) or []:
+        alternatives = getattr(result, "alternatives", []) or []
+        if not alternatives:
+            continue
+        text = str(getattr(alternatives[0], "transcript", "") or "").strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts).strip()
+
+
+def _transcribe_nvidia_riva_hosted(
+    audio: np.ndarray,
+    api_key: str | None,
+    base_url: str | None = None,
+    language: str = "en",
+    model: str | None = None,
+) -> str:
+    if not api_key:
+        raise RuntimeError("NVIDIA API key is required for the hosted Parakeet API.")
+
+    model_id = _nvidia_model_id(model)
+    function_id = NVIDIA_RIVA_FUNCTION_IDS.get(model_id)
+    if not function_id:
+        raise RuntimeError(f"Unsupported NVIDIA Parakeet API model: {model_id}")
+
+    try:
+        import riva.client
+        from riva.client.proto import riva_audio_pb2 as raudio
+    except Exception as exc:
+        raise RuntimeError(
+            "NVIDIA Parakeet API support requires nvidia-riva-client in the Whisperer environment."
+        ) from exc
+
+    auth = riva.client.Auth(
+        use_ssl=True,
+        uri=_nvidia_hosted_uri(base_url),
+        metadata_args=[
+            ["function-id", function_id],
+            ["authorization", f"Bearer {api_key}"],
+        ],
+        options=[
+            ("grpc.max_send_message_length", 50 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 50 * 1024 * 1024),
+        ],
+    )
+    config = riva.client.RecognitionConfig(
+        encoding=raudio.LINEAR_PCM,
+        sample_rate_hertz=16000,
+        language_code=_nvidia_language_code(language, model_id),
+        max_alternatives=1,
+        audio_channel_count=1,
+        enable_automatic_punctuation=True,
+    )
+    service = riva.client.ASRService(auth)
+    with timed("transcribe_nvidia_riva"):
+        response = service.offline_recognize(_audio_to_pcm16_bytes(audio), config)
+    return _riva_response_text(response)
+
+
 def transcribe_nvidia_nim(
     audio: np.ndarray,
     api_key: str | None,
@@ -510,13 +632,22 @@ def transcribe_nvidia_nim(
     language: str = "en",
     model: str | None = None,
 ) -> str:
-    """Transcribe via NVIDIA ASR NIM HTTP endpoint."""
+    """Transcribe via NVIDIA's hosted Parakeet API or a local NIM HTTP endpoint."""
+    if _should_use_nvidia_hosted_api(api_key, base_url):
+        return _transcribe_nvidia_riva_hosted(
+            audio,
+            api_key,
+            base_url=base_url,
+            language=language,
+            model=model,
+        )
+
     language_value = (language or "").strip() or "multi"
     if language_value.lower() == "auto":
         language_value = "multi"
     body, boundary = _multipart_transcription_body(
         audio,
-        model=(model or DEFAULT_NVIDIA_NIM_STT_MODEL).strip() or DEFAULT_NVIDIA_NIM_STT_MODEL,
+        model=_nvidia_model_id(model),
         language=language_value,
         include_model=False,
     )
@@ -524,7 +655,7 @@ def transcribe_nvidia_nim(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
-        _normalize_transcriptions_url(base_url or "http://localhost:9000/v1/audio/transcriptions"),
+        _normalize_transcriptions_url(base_url or NVIDIA_NIM_LOCAL_HTTP_URL),
         data=body,
         headers=headers,
         method="POST",

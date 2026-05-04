@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -19,6 +20,7 @@ import sys
 import threading
 import time
 import ctypes
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -43,6 +45,8 @@ from ui.tray import TrayIcon
 ENGINE_FORCE_STOP_RESTART_CODE = 42
 GPU_AUTO_VALUE = "auto"
 GROQ_RUNTIME_VALUE = "groq_api"
+NVIDIA_NIM_RUNTIME_VALUE = "nvidia_nim_api"
+NVIDIA_NIM_DEFAULT_MODEL = "parakeet-tdt-0.6b-v2"
 LOADING_PREVIEW_HIDE_MS = 1400
 LOADING_READY_MORPH_HIDE_MS = 900
 LOADING_INTERACTION_HIDE_RETRY_MS = 450
@@ -72,6 +76,11 @@ API_KEY_SERVICES = {
     "openai_compat": "OpenAI-compatible LLM",
     "openai_compat_stt": "OpenAI-compatible STT",
 }
+
+UPDATE_REPO = "kynewman/Whisperer-Mac"
+UPDATE_RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
+UPDATE_LATEST_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_ALL_RELEASES_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases"
 
 
 class _DwmMargins(ctypes.Structure):
@@ -119,6 +128,32 @@ GROQ_STT_MODEL_META = {
     },
 }
 
+NVIDIA_NIM_MODEL_OPTIONS = [
+    {
+        "value": "parakeet-tdt-0.6b-v2",
+        "label": "NVIDIA Parakeet TDT 0.6B v2",
+        "hint": "Fast, English",
+    },
+    {
+        "value": "parakeet-ctc-0.6b-asr",
+        "label": "NVIDIA Parakeet CTC 0.6B",
+        "hint": "English",
+    },
+    {
+        "value": "parakeet-1.1b-rnnt-multilingual-asr",
+        "label": "NVIDIA Parakeet RNNT 1.1B",
+        "hint": "Multilingual",
+    },
+]
+
+
+def _nvidia_nim_model_value(value: str | None) -> str:
+    aliases = {
+        "parakeet-1.1b-rnnt-multilingual": "parakeet-1.1b-rnnt-multilingual-asr",
+    }
+    cleaned = (value or "").strip()
+    return aliases.get(cleaned, cleaned)
+
 
 def _available_model_options() -> list[dict[str, str]]:
     if sys.platform == "darwin":
@@ -149,6 +184,55 @@ def _react_index_url() -> QUrl:
 def _normalize_keyboard_hotkey(hotkey: str | None) -> str | None:
     """Convert UI key names into names understood by the native hotkey backend."""
     return hotkeys.normalize_hotkey(hotkey)
+
+
+def _version_parts(value: str | None) -> tuple[int, ...]:
+    parts = [int(part) for part in re.findall(r"\d+", value or "")[:4]]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _release_version(tag: str | None, name: str | None = None) -> str:
+    source = tag or name or ""
+    match = re.search(r"(\d+(?:\.\d+){1,3})", source)
+    return match.group(1) if match else source.strip().lstrip("v")
+
+
+def _is_newer_release(current: str, latest: str) -> bool:
+    return _version_parts(latest) > _version_parts(current)
+
+
+def _utc_timestamp() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def _select_macos_release_asset(release: dict[str, Any]) -> dict[str, Any] | None:
+    assets = [asset for asset in release.get("assets", []) if isinstance(asset, dict)]
+    dmg_assets = [
+        asset
+        for asset in assets
+        if str(asset.get("name") or "").lower().endswith(".dmg")
+        and str(asset.get("browser_download_url") or "").strip()
+    ]
+    preferred = [
+        asset
+        for asset in dmg_assets
+        if any(token in str(asset.get("name") or "").lower() for token in ("mac", "macos", "arm64", "whisperer"))
+    ]
+    if preferred:
+        return preferred[0]
+    return dmg_assets[0] if dmg_assets else None
+
+
+def _app_bundle_path() -> str:
+    path = os.path.abspath(sys.executable)
+    while path and path != os.path.dirname(path):
+        if path.endswith(".app"):
+            return path
+        path = os.path.dirname(path)
+    default_path = "/Applications/Whisperer.app"
+    return default_path if os.path.isdir(default_path) else ""
 
 
 class Bridge(QObject):
@@ -313,6 +397,14 @@ class Bridge(QObject):
     def testApiKey(self, service: str) -> str:
         return self._window.test_api_key(service)
 
+    @pyqtSlot(result=str)
+    def checkForUpdates(self) -> str:
+        return self._window.check_for_updates()
+
+    @pyqtSlot(result=str)
+    def installUpdate(self) -> str:
+        return self._window.install_update()
+
 
 _BRIDGE_SHIM = r"""
 (function() {
@@ -365,7 +457,9 @@ _BRIDGE_SHIM = r"""
         },
         setApiKey: function(service, value) { return callResult("setApiKey", service, value || ""); },
         deleteApiKey: function(service) { return callResult("deleteApiKey", service); },
-        testApiKey: function(service) { return callResult("testApiKey", service); }
+        testApiKey: function(service) { return callResult("testApiKey", service); },
+        checkForUpdates: function() { return callResult("checkForUpdates"); },
+        installUpdate: function() { return callResult("installUpdate"); }
       };
       b.engineStateChanged.connect(function(state) {
         window.dispatchEvent(new CustomEvent("whisperer:engineState", { detail: state }));
@@ -407,6 +501,7 @@ class MainWindow(QMainWindow):
 
     loadingPreviewRequested = pyqtSignal()
     backupTranscriptionFinished = pyqtSignal(str, bool, str, str)
+    updateStatusChanged = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -445,6 +540,8 @@ class MainWindow(QMainWindow):
         self._backup_transcription_error = ""
         self._backup_transcription_request_id = ""
         self._backup_transcription_source = ""
+        self._update_status = self._default_update_status()
+        self._update_install_script = ""
         self._microphone_cache: list[dict[str, str]] = []
         self._microphone_cache_ts = 0.0
         self._input_channel_count_cache: dict[str, tuple[float, int]] = {}
@@ -468,6 +565,7 @@ class MainWindow(QMainWindow):
         self._backup_transcription_timeout_timer.timeout.connect(self._on_backup_transcription_timeout)
         self.loadingPreviewRequested.connect(self._show_loading_preview)
         self.backupTranscriptionFinished.connect(self._finish_last_dictation_transcription)
+        self.updateStatusChanged.connect(self._apply_update_status)
         if self._loading_preview_enabled:
             self._register_loading_preview_shortcuts()
 
@@ -518,6 +616,7 @@ class MainWindow(QMainWindow):
 
         if self._loading_preview_enabled:
             self.engine_start_timer.start(400)
+        QTimer.singleShot(2400, self._auto_check_for_updates)
 
     def _on_load_finished(self, ok: bool):
         if not ok:
@@ -767,6 +866,8 @@ class MainWindow(QMainWindow):
             "selectedGpu": (
                 GROQ_RUNTIME_VALUE
                 if active_provider == "groq_whisper"
+                else NVIDIA_NIM_RUNTIME_VALUE
+                if active_provider == "nvidia_nim_parakeet"
                 else str(self.settings.get("startup", {}).get("gpu_device", GPU_AUTO_VALUE))
             ),
             "selectedMicrophone": selected_microphone,
@@ -776,6 +877,7 @@ class MainWindow(QMainWindow):
             "micLevel": self._mic_level_payload(),
             "dictationBackup": self._dictation_backup_payload(),
             "apiKeys": self._api_key_payload(),
+            "updateStatus": self._update_status_payload(),
         }
         return json.dumps(snapshot, separators=(",", ":"))
 
@@ -809,6 +911,241 @@ class MainWindow(QMainWindow):
             return {service: bool(get_key(service)) for service in API_KEY_SERVICES}
         except Exception:
             return {service: False for service in API_KEY_SERVICES}
+
+    def _default_update_status(self) -> dict[str, Any]:
+        return {
+            "state": "idle",
+            "busy": False,
+            "message": "Updates have not been checked yet.",
+            "currentVersion": config.VERSION,
+            "latestVersion": "",
+            "latestTag": "",
+            "checkedAt": "",
+            "releaseUrl": UPDATE_RELEASES_URL,
+            "assetName": "",
+            "assetUrl": "",
+            "updateAvailable": False,
+        }
+
+    def _update_status_payload(self) -> dict[str, Any]:
+        payload = dict(self._update_status)
+        payload["currentVersion"] = config.VERSION
+        payload.setdefault("releaseUrl", UPDATE_RELEASES_URL)
+        payload.setdefault("busy", False)
+        payload.setdefault("updateAvailable", False)
+        return payload
+
+    def _set_update_status(self, **updates: Any) -> str:
+        self._update_status.update(updates)
+        self._update_status["currentVersion"] = config.VERSION
+        snapshot = self.snapshot_json()
+        self.bridge.settingsChanged.emit(snapshot)
+        return snapshot
+
+    def _apply_update_status(self, payload_json: str):
+        try:
+            payload = json.loads(payload_json or "{}")
+        except json.JSONDecodeError:
+            payload = {"state": "error", "busy": False, "message": "Could not read update status."}
+        self._update_status.update(payload)
+        self._update_status["currentVersion"] = config.VERSION
+        self._emit_snapshot()
+
+    def _auto_check_for_updates(self):
+        state = str(self._update_status.get("state") or "")
+        if state in {"checking", "installing"}:
+            return
+        self.check_for_updates(automatic=True)
+
+    def check_for_updates(self, automatic: bool = False) -> str:
+        if str(self._update_status.get("state") or "") == "checking":
+            return self.snapshot_json()
+        self._set_update_status(
+            state="checking",
+            busy=True,
+            message="Checking GitHub releases...",
+            checkedAt="",
+            updateAvailable=False,
+        )
+        threading.Thread(target=self._check_for_updates_worker, args=(automatic,), daemon=True).start()
+        return self.snapshot_json()
+
+    def _github_json(self, url: str) -> Any:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"Whisperer/{config.VERSION}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _fetch_latest_release(self) -> dict[str, Any]:
+        try:
+            payload = self._github_json(UPDATE_LATEST_API_URL)
+            if isinstance(payload, dict):
+                return payload
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (403, 404):
+                raise
+        releases = self._github_json(UPDATE_ALL_RELEASES_API_URL)
+        if not isinstance(releases, list):
+            raise RuntimeError("GitHub returned an unexpected release list.")
+        for release in releases:
+            if not isinstance(release, dict):
+                continue
+            if release.get("draft") or release.get("prerelease"):
+                continue
+            return release
+        raise RuntimeError("No public Whisperer Mac releases were found.")
+
+    def _status_from_release(self, release: dict[str, Any]) -> dict[str, Any]:
+        tag = str(release.get("tag_name") or "")
+        name = str(release.get("name") or "")
+        latest_version = _release_version(tag, name)
+        release_url = str(release.get("html_url") or UPDATE_RELEASES_URL)
+        asset = _select_macos_release_asset(release)
+        update_available = bool(latest_version and _is_newer_release(config.VERSION, latest_version))
+        asset_name = str(asset.get("name") or "") if asset else ""
+        asset_url = str(asset.get("browser_download_url") or "") if asset else ""
+        if update_available and asset_url:
+            state = "available"
+            message = f"Whisperer {latest_version} is available."
+        elif update_available:
+            state = "error"
+            message = f"Whisperer {latest_version} is available, but the release has no macOS DMG."
+        else:
+            state = "up_to_date"
+            message = "Whisperer is up to date."
+        return {
+            "state": state,
+            "busy": False,
+            "message": message,
+            "currentVersion": config.VERSION,
+            "latestVersion": latest_version,
+            "latestTag": tag,
+            "checkedAt": _utc_timestamp(),
+            "releaseUrl": release_url,
+            "assetName": asset_name,
+            "assetUrl": asset_url,
+            "updateAvailable": update_available and bool(asset_url),
+        }
+
+    def _check_for_updates_worker(self, automatic: bool):
+        try:
+            status = self._status_from_release(self._fetch_latest_release())
+        except Exception as exc:
+            message = "Could not check for updates."
+            if not automatic:
+                message = f"{message} {exc}"
+            status = {
+                "state": "error",
+                "busy": False,
+                "message": message,
+                "checkedAt": _utc_timestamp(),
+                "updateAvailable": False,
+                "releaseUrl": UPDATE_RELEASES_URL,
+            }
+        self.updateStatusChanged.emit(json.dumps(status, separators=(",", ":")))
+
+    def install_update(self) -> str:
+        if str(self._update_status.get("state") or "") == "installing":
+            return self.snapshot_json()
+        if sys.platform != "darwin":
+            return self._set_update_status(
+                state="error",
+                busy=False,
+                message="Automatic updates are only available in the macOS app.",
+            )
+        asset_url = str(self._update_status.get("assetUrl") or "")
+        if not self._update_status.get("updateAvailable") or not asset_url:
+            return self._set_update_status(
+                state="error",
+                busy=False,
+                message="No downloadable update is available yet. Check for updates first.",
+            )
+        app_bundle = _app_bundle_path()
+        if not app_bundle or not os.path.isdir(app_bundle):
+            return self._set_update_status(
+                state="error",
+                busy=False,
+                message="Whisperer needs to be running from a macOS app bundle to update itself.",
+            )
+        try:
+            script_path = self._write_update_installer_script(app_bundle, asset_url)
+            subprocess.Popen(
+                ["/bin/zsh", script_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            return self._set_update_status(
+                state="error",
+                busy=False,
+                message=f"Could not start the updater. {exc}",
+            )
+        asset_name = str(self._update_status.get("assetName") or "the latest release")
+        return self._set_update_status(
+            state="installing",
+            busy=True,
+            message=f"Downloading {asset_name}. Whisperer will restart when the update is installed.",
+        )
+
+    def _write_update_installer_script(self, app_bundle: str, asset_url: str) -> str:
+        log_dir = os.path.join(get_app_data_dir(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "updater.log")
+        script_dir = tempfile.mkdtemp(prefix="whisperer-update-", dir=tempfile.gettempdir())
+        script_path = os.path.join(script_dir, "install_update.zsh")
+        pid = os.getpid()
+        quoted_url = shlex.quote(asset_url)
+        quoted_app = shlex.quote(app_bundle)
+        quoted_log = shlex.quote(log_path)
+        app_name = shlex.quote(os.path.splitext(os.path.basename(app_bundle))[0] or "Whisperer")
+        script = f"""#!/bin/zsh
+set -euo pipefail
+URL={quoted_url}
+APP_BUNDLE={quoted_app}
+APP_NAME={app_name}
+UI_PID={pid}
+LOG={quoted_log}
+TMP_DIR="$(mktemp -d /tmp/whisperer-update.XXXXXX)"
+MOUNT_DIR="$TMP_DIR/mount"
+DMG_PATH="$TMP_DIR/update.dmg"
+trap 'hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1 || true; rm -rf "$TMP_DIR"' EXIT
+mkdir -p "$MOUNT_DIR"
+echo "$(date) starting update from $URL" >> "$LOG"
+/usr/bin/curl --fail --location --retry 2 --connect-timeout 15 --max-time 600 --output "$DMG_PATH" "$URL" >> "$LOG" 2>&1
+/usr/bin/hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR" >> "$LOG" 2>&1
+SRC_APP="$(/usr/bin/find "$MOUNT_DIR" -maxdepth 3 -name 'Whisperer.app' -type d -print -quit)"
+if [[ -z "$SRC_APP" ]]; then
+  echo "$(date) no Whisperer.app found in DMG" >> "$LOG"
+  exit 1
+fi
+/usr/bin/ditto "$SRC_APP" "$TMP_DIR/Whisperer.app" >> "$LOG" 2>&1
+/usr/bin/osascript -e "tell application \\"$APP_NAME\\" to quit" >/dev/null 2>&1 || true
+for i in {{1..40}}; do
+  /bin/kill -0 "$UI_PID" >/dev/null 2>&1 || break
+  /bin/sleep 0.25
+done
+/bin/kill -9 "$UI_PID" >/dev/null 2>&1 || true
+/usr/bin/pkill -9 -f "$APP_BUNDLE/Contents/MacOS/Whisperer" >/dev/null 2>&1 || true
+/bin/rm -rf "$APP_BUNDLE"
+/usr/bin/ditto "$TMP_DIR/Whisperer.app" "$APP_BUNDLE" >> "$LOG" 2>&1
+/usr/bin/xattr -dr com.apple.quarantine "$APP_BUNDLE" >/dev/null 2>&1 || true
+/usr/bin/open -a "$APP_BUNDLE"
+echo "$(date) update installed" >> "$LOG"
+"""
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(script)
+        os.chmod(script_path, 0o700)
+        self._update_install_script = script_path
+        return script_path
 
     def _dictation_backup_payload(self) -> dict[str, Any]:
         try:
@@ -1009,6 +1346,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         options = [{"value": value, "label": label} for label, value in self._gpu_options]
         options.append({"value": "__cloud_runtime_divider__", "label": "", "divider": True})
         options.append({"value": GROQ_RUNTIME_VALUE, "label": "Groq API", "hint": "Cloud"})
+        options.append({"value": NVIDIA_NIM_RUNTIME_VALUE, "label": "NVIDIA Parakeet API", "hint": "Cloud"})
         return options
 
     def _groq_stt_fallback_options(self) -> list[dict[str, str]]:
@@ -1041,7 +1379,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 headers={
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/5.5.2",
+                    "User-Agent": "Whisperer/5.5.3",
                     "Accept": "application/json",
                 },
                 method="GET",
@@ -1068,6 +1406,8 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
     def _model_options_for_provider(self, provider: str) -> list[dict[str, str]]:
         if provider == "groq_whisper":
             return self._load_groq_stt_model_options()
+        if provider == "nvidia_nim_parakeet":
+            return NVIDIA_NIM_MODEL_OPTIONS
         return _available_model_options()
 
     def _selected_model_for_provider(self, provider: str, active_mode, options: list[dict[str, str]]) -> str:
@@ -1075,6 +1415,9 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         if provider == "groq_whisper":
             value = (getattr(active_mode, "stt_model", None) or "whisper-large-v3-turbo").strip()
             return value if value in valid_values else "whisper-large-v3-turbo"
+        if provider == "nvidia_nim_parakeet":
+            value = _nvidia_nim_model_value(getattr(active_mode, "stt_model", None))
+            return value if value in valid_values else NVIDIA_NIM_DEFAULT_MODEL
         return self._current_model_value()
 
     def _update_dashboard_active_stt(self, provider: str, model: str | None = None) -> bool:
@@ -1102,6 +1445,17 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
             self.bridge.settingsChanged.emit(snapshot)
             return snapshot
 
+        if provider == "nvidia_nim_parakeet":
+            options = NVIDIA_NIM_MODEL_OPTIONS
+            valid_values = {item["value"] for item in options}
+            value = _nvidia_nim_model_value(value)
+            if value not in valid_values:
+                value = NVIDIA_NIM_DEFAULT_MODEL
+            self._update_dashboard_active_stt("nvidia_nim_parakeet", value)
+            snapshot = self.snapshot_json()
+            self.bridge.settingsChanged.emit(snapshot)
+            return snapshot
+
         options = _available_model_options()
         valid_values = {item["value"] for item in options}
         if value not in valid_values:
@@ -1120,6 +1474,17 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
             if current_model not in valid_groq_models:
                 current_model = "whisper-large-v3-turbo"
             self._update_dashboard_active_stt("groq_whisper", current_model)
+            snapshot = self.snapshot_json()
+            self.bridge.settingsChanged.emit(snapshot)
+            return snapshot
+
+        if value == NVIDIA_NIM_RUNTIME_VALUE:
+            active_mode = self._dashboard_active_mode()
+            current_model = _nvidia_nim_model_value(getattr(active_mode, "stt_model", None))
+            valid_nvidia_models = {item["value"] for item in NVIDIA_NIM_MODEL_OPTIONS}
+            if current_model not in valid_nvidia_models:
+                current_model = NVIDIA_NIM_DEFAULT_MODEL
+            self._update_dashboard_active_stt("nvidia_nim_parakeet", current_model)
             snapshot = self.snapshot_json()
             self.bridge.settingsChanged.emit(snapshot)
             return snapshot
@@ -1242,7 +1607,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 {
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/5.5.2",
+                    "User-Agent": "Whisperer/5.5.3",
                     "Accept": "application/json",
                 },
             ),
