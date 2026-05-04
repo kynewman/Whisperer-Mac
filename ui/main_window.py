@@ -377,6 +377,14 @@ class Bridge(QObject):
     def setShortcut(self, name: str, value: str) -> str:
         return self._window.set_shortcut(name, value)
 
+    @pyqtSlot(bool, result=str)
+    def setShortcutCaptureActive(self, active: bool) -> str:
+        return self._window.set_shortcut_capture_active(bool(active))
+
+    @pyqtSlot(result=str)
+    def shortcutModifierState(self) -> str:
+        return self._window.shortcut_modifier_state()
+
     @pyqtSlot(str, str, str, result=str)
     def setSetting(self, section: str, key: str, value_json: str) -> str:
         try:
@@ -452,6 +460,8 @@ _BRIDGE_SHIM = r"""
         },
         deleteAutoRule: function(ruleId) { return callResult("deleteAutoRule", ruleId); },
         setShortcut: function(name, value) { return callResult("setShortcut", name, value); },
+        setShortcutCaptureActive: function(active) { return callResult("setShortcutCaptureActive", !!active); },
+        shortcutModifierState: function() { return callResult("shortcutModifierState"); },
         setSetting: function(section, key, value) {
           return callResult("setSetting", section, key, JSON.stringify(value));
         },
@@ -551,6 +561,7 @@ class MainWindow(QMainWindow):
         self._loading_preview_enabled = self._should_auto_start_engine()
         self._loading_preview_hotkeys: list = []
         self._loading_preview_locked = False
+        self._shortcut_capture_active = False
         self._loading_preview_overlay = WaveformOverlay()
         self._loading_preview_overlay.open_ui_requested.connect(self.show_window)
         self._loading_preview_overlay.force_stop_requested.connect(self.stop_engine)
@@ -566,7 +577,7 @@ class MainWindow(QMainWindow):
         self.loadingPreviewRequested.connect(self._show_loading_preview)
         self.backupTranscriptionFinished.connect(self._finish_last_dictation_transcription)
         self.updateStatusChanged.connect(self._apply_update_status)
-        if self._loading_preview_enabled:
+        if self._loading_preview_enabled and not self._shortcut_capture_active:
             self._register_loading_preview_shortcuts()
 
         self.view = QWebEngineView(self)
@@ -1192,18 +1203,21 @@ echo "$(date) update installed" >> "$LOG"
         return snapshot
 
     def _send_engine_backup_transcription_request(self, request_id: str) -> bool:
+        return self._send_engine_command(
+            {"command": "transcribe_last_dictation", "requestId": request_id},
+            require_running=True,
+        )
+
+    def _send_engine_command(self, payload: dict[str, Any], require_running: bool = False) -> bool:
         if (
-            self._engine_state != "running"
+            (require_running and self._engine_state != "running")
             or not self.process
             or self.process.poll() is not None
             or not self.process.stdin
         ):
             return False
         try:
-            command = json.dumps(
-                {"command": "transcribe_last_dictation", "requestId": request_id},
-                separators=(",", ":"),
-            )
+            command = json.dumps(payload, separators=(",", ":"))
             self.process.stdin.write(command + "\n")
             self.process.stdin.flush()
             return True
@@ -1379,7 +1393,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 headers={
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/5.5.3",
+                    "User-Agent": "Whisperer/5.5.4",
                     "Accept": "application/json",
                 },
                 method="GET",
@@ -1607,7 +1621,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 {
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/5.5.3",
+                    "User-Agent": "Whisperer/5.5.4",
                     "Accept": "application/json",
                 },
             ),
@@ -1655,6 +1669,21 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         if self.process and self.process.poll() is None:
             self.restart_engine()
         return snapshot
+
+    def set_shortcut_capture_active(self, active: bool) -> str:
+        active = bool(active)
+        self._shortcut_capture_active = active
+        if active:
+            self._unregister_loading_preview_shortcuts()
+        elif self._loading_preview_enabled and self._engine_state != "running":
+            self._register_loading_preview_shortcuts()
+        self._send_engine_command({"command": "set_hotkeys_paused", "paused": active})
+        return self.snapshot_json()
+
+    def shortcut_modifier_state(self) -> str:
+        order = {"ctrl": 0, "alt": 1, "shift": 2, "cmd": 3, "fn": 4}
+        modifiers = sorted(hotkeys.pressed_modifiers(), key=lambda value: order.get(value, 99))
+        return json.dumps({"modifiers": modifiers}, separators=(",", ":"))
 
     def _launch_on_login_enabled(self) -> bool:
         try:
@@ -1801,15 +1830,49 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
             lookup = {
                 "ctrl": "Ctrl",
                 "control": "Ctrl",
-                "alt": "Alt",
+                "alt": "Option" if sys.platform == "darwin" else "Alt",
                 "option": "Option",
                 "shift": "Shift",
                 "cmd": "Cmd" if sys.platform == "darwin" else "Windows",
+                "fn": "Fn",
                 "left windows": "Cmd" if sys.platform == "darwin" else "Left Windows",
                 "right windows": "Cmd" if sys.platform == "darwin" else "Right Windows",
                 "windows": "Cmd" if sys.platform == "darwin" else "Windows",
                 "win": "Cmd" if sys.platform == "darwin" else "Windows",
                 "escape": "Esc",
+                "page up": "Page Up",
+                "page down": "Page Down",
+                "space": "Space",
+                "enter": "Enter",
+                "tab": "Tab",
+                "backspace": "Backspace",
+                "delete": "Delete",
+                "left": "Left",
+                "right": "Right",
+                "up": "Up",
+                "down": "Down",
+                "plus": "Plus",
+                "minus": "Minus",
+                "equals": "Equals",
+                "comma": "Comma",
+                "period": "Period",
+                "slash": "Slash",
+                "backslash": "Backslash",
+                "semicolon": "Semicolon",
+                "quote": "Quote",
+                "grave": "Grave",
+                "left bracket": "Left Bracket",
+                "right bracket": "Right Bracket",
+                "exclamation": "Exclamation",
+                "at": "At",
+                "hash": "Hash",
+                "dollar": "Dollar",
+                "percent": "Percent",
+                "caret": "Caret",
+                "ampersand": "Ampersand",
+                "asterisk": "Asterisk",
+                "left paren": "Left Paren",
+                "right paren": "Right Paren",
             }
             labels.append(lookup.get(key.lower(), key[:1].upper() + key[1:]))
         return labels
@@ -2174,7 +2237,10 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         self._terminate_orphan_engine_processes()
         self.settings = load_settings()
         self._loading_preview_enabled = True
-        self._register_loading_preview_shortcuts()
+        if self._shortcut_capture_active:
+            self._unregister_loading_preview_shortcuts()
+        else:
+            self._register_loading_preview_shortcuts()
         self._engine_output_lines.clear()
         create_no_window = 0x08000000
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2206,6 +2272,8 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         self._log_web_ui(f"Starting engine: {' '.join(command)}")
         env["WHISPERER_UI_LOADING_PREVIEW"] = "1"
         env["WHISPERER_ENGINE_PARENT_UI"] = "1"
+        if self._shortcut_capture_active:
+            env["WHISPERER_HOTKEYS_PAUSED"] = "1"
         if sys.platform == "darwin":
             env["WHISPERER_ENGINE_ACCESSORY"] = "1"
             env["QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM"] = "1"

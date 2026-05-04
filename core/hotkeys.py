@@ -21,10 +21,16 @@ try:
 except Exception:
     _pynput_keyboard = None
 
+try:
+    import Quartz as _quartz
+except Exception:
+    _quartz = None
+
 
 _pressed: set[str] = set()
 _bindings: list[dict[str, object]] = []
 _listener = None
+_fn_poll_started = False
 _lock = threading.RLock()
 
 
@@ -41,12 +47,39 @@ def _canonical_name(name: str | None) -> str:
         "right windows": "cmd" if IS_MAC else "right windows",
         "option": "alt",
         "menu": "alt",
+        "function": "fn",
         "esc": "escape",
         "return": "enter",
         "arrowleft": "left",
         "arrowright": "right",
         "arrowup": "up",
         "arrowdown": "down",
+        "pgup": "page up",
+        "pageup": "page up",
+        "pgdn": "page down",
+        "pagedown": "page down",
+        "+": "plus",
+        "-": "minus",
+        "=": "equals",
+        ",": "comma",
+        ".": "period",
+        "/": "slash",
+        "\\": "backslash",
+        ";": "semicolon",
+        "'": "quote",
+        "`": "grave",
+        "[": "left bracket",
+        "]": "right bracket",
+        "!": "exclamation",
+        "@": "at",
+        "#": "hash",
+        "$": "dollar",
+        "%": "percent",
+        "^": "caret",
+        "&": "ampersand",
+        "*": "asterisk",
+        "(": "left paren",
+        ")": "right paren",
     }
     return lookup.get(key, key)
 
@@ -54,8 +87,15 @@ def _canonical_name(name: str | None) -> str:
 def normalize_hotkey(hotkey: str | None) -> str | None:
     if not hotkey:
         return hotkey
-    parts = [_canonical_name(part) for part in str(hotkey).split("+") if part.strip()]
-    return "+".join(part for part in parts if part)
+    parts = []
+    seen = set()
+    for part in str(hotkey).split("+"):
+        normalized = _canonical_name(part)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        parts.append(normalized)
+    return "+".join(parts)
 
 
 def _parts(hotkey: str | None) -> set[str]:
@@ -91,17 +131,72 @@ def _key_to_name(key) -> str:
         _pynput_keyboard.Key.tab: "tab",
         _pynput_keyboard.Key.backspace: "backspace",
         _pynput_keyboard.Key.delete: "delete",
+        _pynput_keyboard.Key.home: "home",
+        _pynput_keyboard.Key.end: "end",
+        _pynput_keyboard.Key.page_up: "page up",
+        _pynput_keyboard.Key.page_down: "page down",
     }
+    for index in range(1, 21):
+        function_key = getattr(_pynput_keyboard.Key, f"f{index}", None)
+        if function_key is not None:
+            special[function_key] = f"f{index}"
     if key in special:
         return special[key]
     char = getattr(key, "char", None)
     if char:
-        return char.lower()
+        return _canonical_name(char.lower())
     return ""
+
+
+def _macos_modifier_flags() -> set[str]:
+    if not IS_MAC or _quartz is None:
+        return set()
+    try:
+        flags = _quartz.CGEventSourceFlagsState(_quartz.kCGEventSourceStateCombinedSessionState)
+        pressed = set()
+        if flags & _quartz.kCGEventFlagMaskControl:
+            pressed.add("ctrl")
+        if flags & _quartz.kCGEventFlagMaskAlternate:
+            pressed.add("alt")
+        if flags & _quartz.kCGEventFlagMaskShift:
+            pressed.add("shift")
+        if flags & _quartz.kCGEventFlagMaskCommand:
+            pressed.add("cmd")
+        if flags & _quartz.kCGEventFlagMaskSecondaryFn:
+            pressed.add("fn")
+        return pressed
+    except Exception:
+        return set()
+
+
+def _sync_macos_modifier_state() -> None:
+    if not IS_MAC:
+        return
+    pressed = _macos_modifier_flags()
+    modifier_names = {"ctrl", "alt", "shift", "cmd", "fn"}
+    with _lock:
+        _pressed.difference_update(modifier_names - pressed)
+        _pressed.update(pressed)
+
+
+def pressed_modifiers() -> set[str]:
+    if IS_MAC:
+        return _macos_modifier_flags()
+    if _keyboard is None:
+        return set()
+    pressed = set()
+    for name in ("ctrl", "alt", "shift", "left windows", "right windows"):
+        try:
+            if _keyboard.is_pressed(name):
+                pressed.add(_canonical_name(name))
+        except Exception:
+            pass
+    return pressed
 
 
 def _dispatch_bindings() -> None:
     callbacks: list[Callable[[], None]] = []
+    _sync_macos_modifier_state()
     with _lock:
         for binding in _bindings:
             parts = binding["parts"]
@@ -152,6 +247,27 @@ def _ensure_macos_listener() -> bool:
             return False
 
 
+def _ensure_macos_fn_poll() -> None:
+    global _fn_poll_started
+    if not IS_MAC or _quartz is None:
+        return
+    with _lock:
+        if _fn_poll_started:
+            return
+        _fn_poll_started = True
+
+    def _poll():
+        previous = None
+        while True:
+            current = "fn" in _macos_modifier_flags()
+            if current != previous:
+                previous = current
+                _dispatch_bindings()
+            threading.Event().wait(0.025)
+
+    threading.Thread(target=_poll, daemon=True).start()
+
+
 def add_hotkey(hotkey: str | None, callback: Callable[[], None], suppress: bool = False):
     normalized = normalize_hotkey(hotkey)
     if not normalized:
@@ -162,6 +278,8 @@ def add_hotkey(hotkey: str | None, callback: Callable[[], None], suppress: bool 
         binding = {"parts": _parts(normalized), "callback": callback, "active": False}
         with _lock:
             _bindings.append(binding)
+        if "fn" in binding["parts"]:
+            _ensure_macos_fn_poll()
         return binding
     if _keyboard is None:
         raise RuntimeError("keyboard package is unavailable.")
@@ -189,6 +307,8 @@ def is_pressed(hotkey: str | None) -> bool:
         return False
     if IS_MAC:
         _ensure_macos_listener()
+        if "fn" in parts:
+            _sync_macos_modifier_state()
         with _lock:
             return parts.issubset(_pressed)
     if _keyboard is None:

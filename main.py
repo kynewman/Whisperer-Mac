@@ -246,6 +246,7 @@ class WhisperApp:
         self._last_dictation_text = ""
         self._last_mic_level_emit = 0.0
         self._registered_hotkeys: list = []
+        self._hotkeys_paused = os.environ.get("WHISPERER_HOTKEYS_PAUSED") == "1"
         self._modes_list: list = []
         self._current_mode_index = 0
         seed_builtins()
@@ -1345,6 +1346,9 @@ class WhisperApp:
     def _register_shortcuts(self):
         """Register all configured keyboard shortcuts."""
         self._unregister_shortcuts()
+        if self._hotkeys_paused:
+            print("Hotkeys paused for shortcut capture.", flush=True)
+            return
         settings = load_settings()
         shortcuts = settings.get("shortcuts", {})
 
@@ -1368,6 +1372,18 @@ class WhisperApp:
         _add(shortcuts.get("mode_prev"), self._on_mode_prev)
         _add(shortcuts.get("repeat_last"), self._on_repeat_last)
         _add(shortcuts.get("open_history"), self._on_open_history)
+
+    def _set_hotkeys_paused(self, paused: bool):
+        paused = bool(paused)
+        if self._hotkeys_paused == paused:
+            return
+        self._hotkeys_paused = paused
+        self._clear_pre_ready_hotkey_suppression()
+        if paused:
+            self._unregister_shortcuts()
+            print("Hotkeys paused for shortcut capture.", flush=True)
+        else:
+            self._register_shortcuts()
 
     def _load_engine_background(self):
         record_timing("engine_import_phase", (time.perf_counter() - _PROCESS_START) * 1000.0)
@@ -1435,6 +1451,8 @@ class WhisperApp:
                             target=lambda: self._transcribe_last_dictation_command(request_id),
                             daemon=True,
                         ).start()
+                    elif payload.get("command") == "set_hotkeys_paused":
+                        self._set_hotkeys_paused(bool(payload.get("paused")))
             except Exception:
                 pass
 
@@ -1484,6 +1502,7 @@ class WhisperApp:
                 pass
 
     def run(self):
+        self._start_stdin_command_reader()
         self._register_shortcuts()
         threading.Thread(target=self._load_engine_background, daemon=True).start()
         sys.exit(self.app.exec())

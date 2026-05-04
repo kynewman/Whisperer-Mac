@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Btn, Card, Eyebrow, Icon, Input, KeyCombo, Row, SectionTitle, Select, Toggle } from "../primitives";
 import { SHORTCUTS } from "../data";
 import type { AppSettings, Tweaks, UpdateStatus } from "../App";
@@ -14,6 +14,14 @@ type ApiKeyTest = {
   ok: boolean;
   message: string;
   testing?: boolean;
+};
+
+type CapturedShortcutKey = {
+  id: string;
+  label: string;
+  value: string;
+  rank: number;
+  order: number;
 };
 
 const DIRECT_TESTS: Record<string, { url: string; header: (key: string) => string; label: string }> = {
@@ -79,6 +87,83 @@ const API_KEY_ROWS: ProviderKey[] = [
   },
 ];
 
+const MODIFIER_TOKENS: Record<string, Omit<CapturedShortcutKey, "order">> = {
+  ctrl: { id: "ctrl", label: "Ctrl", value: "ctrl", rank: 0 },
+  alt: { id: "alt", label: "Option", value: "alt", rank: 1 },
+  shift: { id: "shift", label: "Shift", value: "shift", rank: 2 },
+  cmd: { id: "cmd", label: "Cmd", value: "cmd", rank: 3 },
+  fn: { id: "fn", label: "Fn", value: "fn", rank: 4 },
+};
+
+const SPECIAL_KEY_VALUES: Record<string, { label: string; value: string }> = {
+  Escape: { label: "Esc", value: "escape" },
+  " ": { label: "Space", value: "space" },
+  Spacebar: { label: "Space", value: "space" },
+  Enter: { label: "Enter", value: "enter" },
+  Return: { label: "Enter", value: "enter" },
+  Tab: { label: "Tab", value: "tab" },
+  Backspace: { label: "Backspace", value: "backspace" },
+  Delete: { label: "Delete", value: "delete" },
+  ArrowLeft: { label: "Left", value: "left" },
+  ArrowRight: { label: "Right", value: "right" },
+  ArrowUp: { label: "Up", value: "up" },
+  ArrowDown: { label: "Down", value: "down" },
+  Home: { label: "Home", value: "home" },
+  End: { label: "End", value: "end" },
+  PageUp: { label: "Page Up", value: "page up" },
+  PageDown: { label: "Page Down", value: "page down" },
+};
+
+const SYMBOL_KEY_VALUES: Record<string, { label: string; value: string }> = {
+  "+": { label: "Plus", value: "plus" },
+  "-": { label: "Minus", value: "minus" },
+  "=": { label: "Equals", value: "equals" },
+  ",": { label: "Comma", value: "comma" },
+  ".": { label: "Period", value: "period" },
+  "/": { label: "Slash", value: "slash" },
+  "\\": { label: "Backslash", value: "backslash" },
+  ";": { label: "Semicolon", value: "semicolon" },
+  "'": { label: "Quote", value: "quote" },
+  "`": { label: "Grave", value: "grave" },
+  "[": { label: "Left Bracket", value: "left bracket" },
+  "]": { label: "Right Bracket", value: "right bracket" },
+  "!": { label: "Exclamation", value: "exclamation" },
+  "@": { label: "At", value: "at" },
+  "#": { label: "Hash", value: "hash" },
+  "$": { label: "Dollar", value: "dollar" },
+  "%": { label: "Percent", value: "percent" },
+  "^": { label: "Caret", value: "caret" },
+  "&": { label: "Ampersand", value: "ampersand" },
+  "*": { label: "Asterisk", value: "asterisk" },
+  "(": { label: "Left Paren", value: "left paren" },
+  ")": { label: "Right Paren", value: "right paren" },
+};
+
+const keyTokenFromEvent = (event: KeyboardEvent, order: number): CapturedShortcutKey | null => {
+  if (event.key === "Control") return { ...MODIFIER_TOKENS.ctrl, order };
+  if (event.key === "Alt") return { ...MODIFIER_TOKENS.alt, order };
+  if (event.key === "Shift") return { ...MODIFIER_TOKENS.shift, order };
+  if (event.key === "Meta" || event.key === "OS") return { ...MODIFIER_TOKENS.cmd, order };
+  if (event.key === "Fn" || event.key === "Function" || event.code === "Fn" || event.code === "FnLock") {
+    return { ...MODIFIER_TOKENS.fn, order };
+  }
+  if (/^F([1-9]|1[0-9]|20)$/.test(event.key)) {
+    return { id: event.code || event.key, label: event.key, value: event.key.toLowerCase(), rank: 10, order };
+  }
+  const named = SPECIAL_KEY_VALUES[event.key];
+  if (named) {
+    return { id: event.code || named.value, label: named.label, value: named.value, rank: 10, order };
+  }
+  if (event.key.length === 1) {
+    const symbol = SYMBOL_KEY_VALUES[event.key];
+    if (symbol) {
+      return { id: event.code || symbol.value, label: symbol.label, value: symbol.value, rank: 10, order };
+    }
+    return { id: event.code || event.key, label: event.key.toUpperCase(), value: event.key.toLowerCase(), rank: 10, order };
+  }
+  return null;
+};
+
 export default function ConfigPage({
   tweaks,
   setTweaks,
@@ -123,7 +208,11 @@ export default function ConfigPage({
   const [apiKeyDrafts, setApiKeyDrafts] = useState<Record<string, string>>({});
   const [apiKeyTests, setApiKeyTests] = useState<Record<string, ApiKeyTest>>({});
   const [recordingShortcut, setRecordingShortcut] = useState(false);
-  const [draftShortcut, setDraftShortcut] = useState<string[]>([]);
+  const [pressedShortcut, setPressedShortcut] = useState<CapturedShortcutKey[]>([]);
+  const [draftShortcut, setDraftShortcut] = useState<CapturedShortcutKey[]>([]);
+  const pressedShortcutRef = useRef<Map<string, CapturedShortcutKey>>(new Map());
+  const draftShortcutRef = useRef<CapturedShortcutKey[]>([]);
+  const shortcutOrderRef = useRef(0);
   const [purgeOpen, setPurgeOpen] = useState(false);
   const [purgeText, setPurgeText] = useState("");
 
@@ -165,45 +254,59 @@ export default function ConfigPage({
     setSetting("ui", k, v);
   };
 
-  const labelToHotkey = (key: string) => {
-    const lookup: Record<string, string> = {
-      Ctrl: "ctrl",
-      Alt: "alt",
-      Option: "option",
-      Shift: "shift",
-      Cmd: "cmd",
-      "Left Windows": "left windows",
-      "Right Windows": "right windows",
-      Windows: "windows",
-      Esc: "escape",
-      Space: "space",
-      Left: "left",
-      Right: "right",
-      Up: "up",
-      Down: "down",
-    };
-    return lookup[key] || key.toLowerCase();
+  const sortedShortcut = () =>
+    Array.from(pressedShortcutRef.current.values()).sort((a, b) => a.rank - b.rank || a.order - b.order).slice(0, 6);
+
+  const publishPressedShortcut = (remember = false) => {
+    const next = sortedShortcut();
+    setPressedShortcut(next);
+    if (remember && next.length && next.length >= draftShortcutRef.current.length) {
+      draftShortcutRef.current = next;
+      setDraftShortcut(next);
+    }
   };
 
-  const comboFromEvent = (event: KeyboardEvent) => {
-    const keys: string[] = [];
-    if (event.ctrlKey) keys.push("Ctrl");
-    if (event.altKey) keys.push("Alt");
-    if (event.shiftKey) keys.push("Shift");
-    if (event.metaKey) keys.push("Cmd");
-    const modifierKeys = new Set(["Control", "Shift", "Alt", "Meta", "OS"]);
-    if (!modifierKeys.has(event.key)) {
-      const named: Record<string, string> = {
-        Escape: "Esc",
-        " ": "Space",
-        ArrowLeft: "Left",
-        ArrowRight: "Right",
-        ArrowUp: "Up",
-        ArrowDown: "Down",
-      };
-      keys.push(named[event.key] || (event.key.length === 1 ? event.key.toUpperCase() : event.key));
+  const addModifierFlags = (event: KeyboardEvent) => {
+    const modifiers: Array<[boolean, keyof typeof MODIFIER_TOKENS]> = [
+      [event.ctrlKey, "ctrl"],
+      [event.altKey, "alt"],
+      [event.shiftKey, "shift"],
+      [event.metaKey, "cmd"],
+    ];
+    modifiers.forEach(([active, key]) => {
+      if (!active) {
+        pressedShortcutRef.current.delete(key);
+        return;
+      }
+      if (pressedShortcutRef.current.has(key)) return;
+      shortcutOrderRef.current += 1;
+      pressedShortcutRef.current.set(key, { ...MODIFIER_TOKENS[key], order: shortcutOrderRef.current });
+    });
+  };
+
+  const syncNativeModifiers = (activeModifiers: string[], remember = false) => {
+    const active = new Set(activeModifiers.filter((key): key is keyof typeof MODIFIER_TOKENS => key in MODIFIER_TOKENS));
+    if (pressedShortcutRef.current.size === 0 && active.size > 0) {
+      shortcutOrderRef.current = 0;
+      draftShortcutRef.current = [];
+      setDraftShortcut([]);
     }
-    return Array.from(new Set(keys)).slice(0, 4);
+    (Object.keys(MODIFIER_TOKENS) as Array<keyof typeof MODIFIER_TOKENS>).forEach((key) => {
+      if (active.has(key)) {
+        if (!pressedShortcutRef.current.has(key)) {
+          shortcutOrderRef.current += 1;
+          pressedShortcutRef.current.set(key, { ...MODIFIER_TOKENS[key], order: shortcutOrderRef.current });
+        }
+      } else {
+        pressedShortcutRef.current.delete(key);
+      }
+    });
+    publishPressedShortcut(remember && active.size > 0);
+  };
+
+  const clearPressedShortcut = () => {
+    pressedShortcutRef.current.clear();
+    setPressedShortcut([]);
   };
 
   useEffect(() => {
@@ -211,22 +314,89 @@ export default function ConfigPage({
     const onKeyDown = (event: KeyboardEvent) => {
       event.preventDefault();
       event.stopPropagation();
-      const combo = comboFromEvent(event);
-      if (combo.length) setDraftShortcut(combo);
+      if (pressedShortcutRef.current.size === 0) {
+        shortcutOrderRef.current = 0;
+        draftShortcutRef.current = [];
+        setDraftShortcut([]);
+      }
+      addModifierFlags(event);
+      const key = keyTokenFromEvent(event, shortcutOrderRef.current + 1);
+      if (key && !pressedShortcutRef.current.has(key.id)) {
+        shortcutOrderRef.current += 1;
+        pressedShortcutRef.current.set(key.id, { ...key, order: shortcutOrderRef.current });
+      }
+      publishPressedShortcut(true);
     };
+    const onKeyUp = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const key = keyTokenFromEvent(event, 0);
+      if (key) pressedShortcutRef.current.delete(key.id);
+      publishPressedShortcut(false);
+    };
+    const onBlur = () => {
+      clearPressedShortcut();
+    };
+    let disposed = false;
+    const pollNativeModifiers = () => {
+      window.whisperer?.shortcutModifierState?.()
+        .then((raw) => {
+          if (disposed) return;
+          const parsed = JSON.parse(raw || "{}") as { modifiers?: string[] };
+          syncNativeModifiers(parsed.modifiers || [], true);
+        })
+        .catch(() => {});
+    };
+    window.whisperer?.setShortcutCaptureActive?.(true).catch(() => {});
+    pollNativeModifiers();
+    const modifierPoll = window.setInterval(pollNativeModifiers, 35);
     window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("blur", onBlur, true);
+    return () => {
+      disposed = true;
+      window.clearInterval(modifierPoll);
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+      window.removeEventListener("blur", onBlur, true);
+      window.whisperer?.setShortcutCaptureActive?.(false).catch(() => {});
+    };
   }, [recordingShortcut]);
 
-  const commitShortcut = () => {
-    if (!draftShortcut.length) return;
-    setShortcut("dictation", draftShortcut.map(labelToHotkey).join("+"));
-    setRecordingShortcut(false);
+  const startShortcutCapture = () => {
+    shortcutOrderRef.current = 0;
+    pressedShortcutRef.current.clear();
+    draftShortcutRef.current = [];
+    setPressedShortcut([]);
+    setDraftShortcut([]);
+    setRecordingShortcut(true);
+    window.focus();
   };
 
+  const cancelShortcutCapture = () => {
+    setRecordingShortcut(false);
+    pressedShortcutRef.current.clear();
+    draftShortcutRef.current = [];
+    setPressedShortcut([]);
+    setDraftShortcut([]);
+  };
+
+  const commitShortcut = () => {
+    const captured = draftShortcutRef.current.length ? draftShortcutRef.current : draftShortcut;
+    if (!captured.length) return;
+    setShortcut("dictation", captured.map((key) => key.value).join("+"));
+    cancelShortcutCapture();
+  };
+
+  const displayedShortcut = recordingShortcut ? (draftShortcut.length ? draftShortcut : pressedShortcut) : [];
   const dictationKeys = recordingShortcut
-    ? (draftShortcut.length ? draftShortcut : ["Press keys"])
+    ? (displayedShortcut.length ? displayedShortcut.map((key) => key.label) : ["Recording"])
     : (shortcuts.dictation?.length ? shortcuts.dictation : ["Ctrl", "Cmd"]);
+  const shortcutCaptureStatus = pressedShortcut.length
+    ? "Recording"
+    : draftShortcut.length
+      ? "Captured"
+      : "Recording";
   const updateBusy = Boolean(updateStatus.busy);
   const updateMessage = updateStatus.message || "Updates have not been checked yet.";
   const updateMeta = updateStatus.latestVersion
@@ -364,17 +534,24 @@ export default function ConfigPage({
       <Card style={{ marginBottom: 18 }}>
         <Row
           title="Dictation hotkey"
-          subtitle={recordingShortcut ? "Press up to four keys, then save." : "Hold while speaking. Release to transcribe and paste."}
+          subtitle={recordingShortcut ? "Press a shortcut combination, then confirm it." : "Hold while speaking. Release to transcribe and paste."}
           control={
-            <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-              <KeyCombo keys={dictationKeys} />
-              {recordingShortcut ? (
-                <>
-                  <Btn size="sm" variant="accent" onClick={commitShortcut} disabled={!draftShortcut.length}>Save</Btn>
-                  <Btn size="sm" variant="ghost" onClick={() => { setRecordingShortcut(false); setDraftShortcut([]); }}>Cancel</Btn>
-                </>
-              ) : (
-                <Btn size="sm" variant="secondary" onClick={() => { setDraftShortcut([]); setRecordingShortcut(true); }}>Change</Btn>
+            <div style={{ display: "grid", justifyItems: "end", gap: 5 }}>
+              <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                <KeyCombo keys={dictationKeys} />
+                {recordingShortcut ? (
+                  <>
+                    <Btn size="sm" variant="accent" icon="check" onClick={commitShortcut} disabled={!draftShortcut.length}>OK</Btn>
+                    <Btn size="sm" variant="ghost" onClick={cancelShortcutCapture}>Cancel</Btn>
+                  </>
+                ) : (
+                  <Btn size="sm" variant="secondary" icon="edit" onClick={startShortcutCapture}>Change</Btn>
+                )}
+              </div>
+              {recordingShortcut && (
+                <span style={{ fontSize: 11.5, color: pressedShortcut.length ? "var(--accent-ink)" : "var(--ink-3)", fontWeight: 500 }}>
+                  {shortcutCaptureStatus}
+                </span>
               )}
             </div>
           }

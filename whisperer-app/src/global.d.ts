@@ -31,6 +31,8 @@ declare global {
       addAutoRule?: (modeId: number, type: string, value: string, priority: number) => Promise<string>;
       deleteAutoRule?: (ruleId: number) => Promise<string>;
       setShortcut?: (name: string, value: string) => Promise<string>;
+      setShortcutCaptureActive?: (active: boolean) => Promise<string>;
+      shortcutModifierState?: () => Promise<string>;
       setSetting?: (section: string, key: string, value: unknown) => Promise<string>;
       setApiKey?: (service: string, value: string) => Promise<string>;
       deleteApiKey?: (service: string) => Promise<string>;
