@@ -30,8 +30,9 @@ except Exception:
 _pressed: set[str] = set()
 _bindings: list[dict[str, object]] = []
 _listener = None
-_fn_poll_started = False
+_modifier_poll_started = False
 _lock = threading.RLock()
+_MODIFIER_NAMES = {"ctrl", "alt", "shift", "cmd", "fn"}
 
 
 def _canonical_name(name: str | None) -> str:
@@ -169,13 +170,13 @@ def _macos_modifier_flags() -> set[str]:
         return set()
 
 
-def _sync_macos_modifier_state() -> None:
+def _sync_macos_modifier_state(pressed: set[str] | None = None) -> None:
     if not IS_MAC:
         return
-    pressed = _macos_modifier_flags()
-    modifier_names = {"ctrl", "alt", "shift", "cmd", "fn"}
+    if pressed is None:
+        pressed = _macos_modifier_flags()
     with _lock:
-        _pressed.difference_update(modifier_names - pressed)
+        _pressed.difference_update(_MODIFIER_NAMES - pressed)
         _pressed.update(pressed)
 
 
@@ -194,9 +195,10 @@ def pressed_modifiers() -> set[str]:
     return pressed
 
 
-def _dispatch_bindings() -> None:
+def _dispatch_bindings(*, sync_modifiers: bool = False) -> None:
     callbacks: list[Callable[[], None]] = []
-    _sync_macos_modifier_state()
+    if sync_modifiers:
+        _sync_macos_modifier_state()
     with _lock:
         for binding in _bindings:
             parts = binding["parts"]
@@ -247,21 +249,22 @@ def _ensure_macos_listener() -> bool:
             return False
 
 
-def _ensure_macos_fn_poll() -> None:
-    global _fn_poll_started
+def _ensure_macos_modifier_poll() -> None:
+    global _modifier_poll_started
     if not IS_MAC or _quartz is None:
         return
     with _lock:
-        if _fn_poll_started:
+        if _modifier_poll_started:
             return
-        _fn_poll_started = True
+        _modifier_poll_started = True
 
     def _poll():
         previous = None
         while True:
-            current = "fn" in _macos_modifier_flags()
+            current = _macos_modifier_flags()
             if current != previous:
-                previous = current
+                previous = set(current)
+                _sync_macos_modifier_state(current)
                 _dispatch_bindings()
             threading.Event().wait(0.025)
 
@@ -278,8 +281,8 @@ def add_hotkey(hotkey: str | None, callback: Callable[[], None], suppress: bool 
         binding = {"parts": _parts(normalized), "callback": callback, "active": False}
         with _lock:
             _bindings.append(binding)
-        if "fn" in binding["parts"]:
-            _ensure_macos_fn_poll()
+        if binding["parts"] & _MODIFIER_NAMES:
+            _ensure_macos_modifier_poll()
         return binding
     if _keyboard is None:
         raise RuntimeError("keyboard package is unavailable.")
@@ -307,7 +310,7 @@ def is_pressed(hotkey: str | None) -> bool:
         return False
     if IS_MAC:
         _ensure_macos_listener()
-        if "fn" in parts:
+        if parts & _MODIFIER_NAMES:
             _sync_macos_modifier_state()
         with _lock:
             return parts.issubset(_pressed)
