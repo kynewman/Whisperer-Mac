@@ -115,8 +115,10 @@ def paste_text(
                 delivered = paste_clipboard_to_application(
                     active_app,
                     settle_delay_ms=max(min_settle_delay, paste_delay),
+                    expected_text=text,
                 )
                 if not delivered:
+                    print("PASTE_FALLBACK accessibility_insert_after_shortcut", flush=True)
                     delivered = insert_text_into_focused_control(text, active_app)
             except Exception:
                 delivered = False

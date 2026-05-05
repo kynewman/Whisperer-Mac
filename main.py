@@ -92,7 +92,7 @@ from core.context import (
     get_active_window_title,
     mark_clipboard_pasted,
 )
-from core.formatter import format_transcription
+from core.formatter import format_transcription, prepare_text_for_insertion
 from core.dictionary import add_words_from_list, apply_replacements, get_prompt_words
 from core.term_filter import extract_useful_terms
 from core.modes import resolve_active_mode, list_modes, get_mode_by_name, seed_builtins
@@ -171,6 +171,8 @@ LONGFORM_POLL_INTERVAL_S = 0.004
 LONGFORM_RELEASE_DEBOUNCE_S = 0.012
 LONGFORM_LOCK_GRACE_S = 0.0
 LONGFORM_STOP_ARM_DEBOUNCE_S = 0.06
+DOUBLE_TAP_LOCK_WINDOW_S = 0.34
+DOUBLE_TAP_MAX_FIRST_PRESS_S = 0.42
 LOADING_PREVIEW_HIDE_S = 1.4
 
 
@@ -256,6 +258,9 @@ class WhisperApp:
         self._audio_ducking_ticket = 0
         self._stdin_command_reader_started = False
         self._last_dictation_text = ""
+        self._last_paste_target = ("", "")
+        self._last_paste_needs_space = False
+        self._dictation_press_started_at = 0.0
         self._last_mic_level_emit = 0.0
         self._registered_hotkeys: list = []
         self._hotkeys_paused = os.environ.get("WHISPERER_HOTKEYS_PAUSED") == "1"
@@ -899,8 +904,10 @@ class WhisperApp:
         None if cancelled.
         """
         time.sleep(0.002)
+        started_monotonic = self._dictation_press_started_at or time.monotonic()
         release_seen_at: float | None = None
         release_grace_until: float | None = None
+        double_tap_grace_until: float | None = None
         while True:
             if self._cancelled:
                 return None
@@ -910,13 +917,24 @@ class WhisperApp:
             if self._is_dictation_hotkey_pressed(dictation_hk):
                 release_seen_at = None
                 release_grace_until = None
+                if double_tap_grace_until is not None:
+                    self._request_longform_lock()
+                    return True
                 time.sleep(LONGFORM_POLL_INTERVAL_S)
             else:
                 now = time.monotonic()
                 if release_seen_at is None:
                     release_seen_at = now
                     release_grace_until = now + LONGFORM_LOCK_GRACE_S
+                    if now - started_monotonic <= DOUBLE_TAP_MAX_FIRST_PRESS_S:
+                        double_tap_grace_until = now + DOUBLE_TAP_LOCK_WINDOW_S
                 if now - release_seen_at < LONGFORM_RELEASE_DEBOUNCE_S:
+                    time.sleep(LONGFORM_POLL_INTERVAL_S)
+                    continue
+                if double_tap_grace_until is not None and now < double_tap_grace_until:
+                    if self._longform_lock_requested():
+                        self._request_longform_lock()
+                        return True
                     time.sleep(LONGFORM_POLL_INTERVAL_S)
                     continue
                 if release_grace_until is not None and now < release_grace_until:
@@ -1508,6 +1526,43 @@ class WhisperApp:
             paste_method, restore_clipboard, auto_send, paste_delay, paste_fast_path = self._resolve_paste_method(active_app, mode)
             paste_succeeded = 0
             try:
+                preceding_text = ""
+                preceding_text_known = sys.platform != "darwin"
+                if sys.platform == "darwin":
+                    try:
+                        from core.native import focused_control_preceding_text, focused_control_snapshot
+
+                        focus_snapshot = focused_control_snapshot(active_app)
+                        focus_value = str(focus_snapshot.get("value", "")) if focus_snapshot else ""
+                        focus_range = str(focus_snapshot.get("selected_range", "")).strip() if focus_snapshot else ""
+                        cursor_at_start = focus_range in {"0:0", "0,0"}
+                        # Some apps expose a focused element but not its text. Treat that
+                        # as unknown unless Accessibility explicitly reports cursor 0.
+                        preceding_text_known = bool(focus_snapshot and (focus_value or cursor_at_start))
+                        if focus_snapshot:
+                            preceding_text = focused_control_preceding_text(active_app)
+                            if not preceding_text and not cursor_at_start:
+                                preceding_text_known = False
+                    except Exception:
+                        preceding_text = ""
+                        preceding_text_known = False
+                same_target_as_last_paste = self._last_paste_target == (active_app or "", window_title or "")
+                formatted = prepare_text_for_insertion(
+                    formatted,
+                    preceding_text=preceding_text,
+                    preceding_text_known=preceding_text_known,
+                    fallback_needs_leading_space=bool(
+                        same_target_as_last_paste and self._last_paste_needs_space
+                    ),
+                )
+                print(
+                    "INSERTION_SPACING "
+                    f"known={int(preceding_text_known)} "
+                    f"preceding_tail={preceding_text[-12:]!r} "
+                    f"fallback={int(same_target_as_last_paste and self._last_paste_needs_space)} "
+                    f"leading_space={int(formatted.startswith(' '))}",
+                    flush=True,
+                )
                 with timed("paste_delivery"):
                     print(
                         f"PASTE_ATTEMPT app={active_app!r} method={paste_method!r} chars={len(formatted)}",
@@ -1525,14 +1580,20 @@ class WhisperApp:
                 if not paste_succeeded:
                     raise RuntimeError("Paste command was not delivered.")
                 print("PASTE_DELIVERED", flush=True)
+                self.signals.set_processing.emit(False)
+                self.signals.hide_overlay.emit()
             except Exception as paste_exc:
                 print(f"PASTE_FAILED {paste_exc}", flush=True)
+                self.signals.set_processing.emit(False)
                 self.signals.set_status.emit(f"Paste failed: {paste_exc}")
                 time.sleep(1.5)
+                self.signals.hide_overlay.emit()
 
             self._last_dictation_text = formatted
+            if paste_succeeded:
+                self._last_paste_target = (active_app or "", window_title or "")
+                self._last_paste_needs_space = bool((formatted.rstrip()[-1:] if formatted.rstrip() else "") in ".!?:;")
             mark_clipboard_pasted()
-            self.signals.hide_overlay.emit()
 
             # Determine if we should retain audio
             audio_path = None
@@ -1580,6 +1641,7 @@ class WhisperApp:
 
     def _on_hotkey_pressed(self):
         """Called when user presses the dictation hotkey. Start dictation session in a background thread."""
+        self._dictation_press_started_at = time.monotonic()
         if not self._model_ready.is_set():
             self._store_pending_active_target()
             self._mark_pre_ready_hotkey()
@@ -1588,6 +1650,8 @@ class WhisperApp:
         if self._pre_ready_hotkey_still_held():
             return
         if not self._session_lock.acquire(blocking=False):
+            if self.recorder.is_recording:
+                self._request_longform_lock()
             return
         self._clear_longform_lock()
         active_app, window_title = self._capture_active_target(include_title=False)

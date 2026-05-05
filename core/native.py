@@ -129,6 +129,12 @@ def _run_osascript(script: str, timeout: float = 1.0) -> str:
     return (result.stdout or "").strip()
 
 
+def _applescript_string(value: str) -> str:
+    parts = str(value).split("\n")
+    quoted = ['"' + part.replace("\\", "\\\\").replace('"', '\\"') + '"' for part in parts]
+    return " & linefeed & ".join(quoted) if quoted else '""'
+
+
 def accessibility_access_granted() -> bool:
     """Return whether this process is trusted for Accessibility event posting."""
     if not IS_MAC:
@@ -283,6 +289,119 @@ def focused_control_text(process_name: str = "") -> str:
     ).strip()
 
 
+def focused_control_preceding_text(process_name: str = "", limit: int = 80) -> str:
+    """Return text immediately before the insertion point when Accessibility exposes it."""
+    if not IS_MAC:
+        return ""
+    target = (process_name or "").strip()
+    if target:
+        escaped = target.replace("\\", "\\\\").replace('"', '\\"')
+        process_clause = f"""
+          ignoring case
+            set frontProcess to first application process whose name is "{escaped}"
+          end ignoring
+        """
+    else:
+        process_clause = '          set frontProcess to first application process whose frontmost is true'
+    raw = _run_osascript(
+        f"""
+        tell application "System Events"
+{process_clause}
+          try
+            set focusedElement to value of attribute "AXFocusedUIElement" of frontProcess
+            set fieldValue to ""
+            try
+              set fieldValue to value of focusedElement as string
+            end try
+            if fieldValue is "" then return ""
+
+            set cursorIndex to -1
+            try
+              set selectedRange to value of attribute "AXSelectedTextRange" of focusedElement
+              try
+                set cursorIndex to item 1 of selectedRange
+              on error
+                set cursorIndex to location of selectedRange
+              end try
+            end try
+            if cursorIndex < 0 then return ""
+            if cursorIndex = 0 then return ""
+
+            set textLength to length of fieldValue
+            if cursorIndex > textLength then set cursorIndex to textLength
+            set startIndex to cursorIndex - {max(1, int(limit))} + 1
+            if startIndex < 1 then set startIndex to 1
+            return text startIndex thru cursorIndex of fieldValue
+          on error
+            return ""
+          end try
+        end tell
+        """,
+        timeout=0.8,
+    )
+    return raw[-max(1, int(limit)) :]
+
+
+def focused_control_snapshot(process_name: str = "", value_limit: int = 2000) -> dict[str, str]:
+    """Return focused-control text and selection metadata when Accessibility exposes it."""
+    if not IS_MAC:
+        return {}
+    target = (process_name or "").strip()
+    if target:
+        escaped = target.replace("\\", "\\\\").replace('"', '\\"')
+        process_clause = f"""
+          ignoring case
+            set frontProcess to first application process whose name is "{escaped}"
+          end ignoring
+        """
+    else:
+        process_clause = '          set frontProcess to first application process whose frontmost is true'
+    raw = _run_osascript(
+        f"""
+        tell application "System Events"
+{process_clause}
+          try
+            set focusedElement to value of attribute "AXFocusedUIElement" of frontProcess
+            set fieldValue to ""
+            try
+              set maybeValue to value of focusedElement
+              if maybeValue is not missing value then set fieldValue to maybeValue as string
+            end try
+            set selectionText to ""
+            try
+              set maybeSelection to value of attribute "AXSelectedText" of focusedElement
+              if maybeSelection is not missing value then set selectionText to maybeSelection as string
+            end try
+            set rangeText to ""
+            try
+              set selectedRange to value of attribute "AXSelectedTextRange" of focusedElement
+              try
+                set rangeText to (item 1 of selectedRange as string) & ":" & (item 2 of selectedRange as string)
+              on error
+                set rangeText to (location of selectedRange as string) & ":" & (length of selectedRange as string)
+              end try
+            end try
+            return fieldValue & "<<<WHISPERER_AX_SEP>>>" & selectionText & "<<<WHISPERER_AX_SEP>>>" & rangeText
+          on error
+            return ""
+          end try
+        end tell
+        """,
+        timeout=0.8,
+    )
+    if not raw:
+        return {}
+    parts = raw.split("<<<WHISPERER_AX_SEP>>>", 2)
+    value = parts[0] if parts else ""
+    if len(value) > value_limit:
+        value = value[-value_limit:]
+    return {
+        "value": value,
+        "selected_text": parts[1] if len(parts) > 1 else "",
+        "selected_range": parts[2] if len(parts) > 2 else "",
+    }
+
+
 def activate_application_process(process_name: str) -> bool:
     """Bring a macOS application process back to the front without clicking."""
     if not IS_MAC:
@@ -383,7 +502,25 @@ def _send_shortcut_quartz(shortcut: str) -> bool:
         return False
 
 
-def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int = 80) -> bool:
+def _snapshot_changed_after_insert(before: dict[str, str], after: dict[str, str], text: str) -> bool | None:
+    if not before or not after:
+        return None
+    before_value = before.get("value", "")
+    after_value = after.get("value", "")
+    before_range = before.get("selected_range", "")
+    after_range = after.get("selected_range", "")
+    if not before_value and not after_value and not before_range and not after_range:
+        return None
+    if after_value != before_value:
+        if text and (text.strip() in after_value or len(after_value) >= len(before_value) + min(len(text), 4)):
+            return True
+        return True
+    if after_range != before_range:
+        return True
+    return False
+
+
+def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int = 80, expected_text: str = "") -> bool:
     """Activate the target macOS app and deliver the current clipboard with Cmd+V."""
     if not IS_MAC:
         return False
@@ -399,8 +536,19 @@ def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int 
             time.sleep(0.03)
         if active_window_name().lower() != target.lower():
             return False
+    before = focused_control_snapshot(target) if expected_text else {}
     time.sleep(max(0, int(settle_delay_ms)) / 1000.0)
-    return send_shortcut("cmd+v")
+    if not send_shortcut("cmd+v"):
+        return False
+    if not expected_text:
+        return True
+    time.sleep(0.08)
+    after = focused_control_snapshot(target)
+    changed = _snapshot_changed_after_insert(before, after, expected_text)
+    if changed is False:
+        print("PASTE_VERIFY no_focused_text_change_after_shortcut", flush=True)
+        return False
+    return True
 
 
 def insert_text_into_focused_control(text: str, process_name: str = "") -> bool:
@@ -413,7 +561,7 @@ def insert_text_into_focused_control(text: str, process_name: str = "") -> bool:
         if current.lower() != target.lower() and not activate_application_process(target):
             return False
         time.sleep(0.08)
-    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    text_literal = _applescript_string(text)
     result = _run_osascript(
         f"""
         tell application "System Events"
@@ -421,15 +569,15 @@ def insert_text_into_focused_control(text: str, process_name: str = "") -> bool:
             set frontProcess to first application process whose frontmost is true
             set focusedElement to value of attribute "AXFocusedUIElement" of frontProcess
             try
-              set selected text of focusedElement to "{escaped}"
+              set selected text of focusedElement to {text_literal}
               return "ok"
             end try
             try
-              set value of attribute "AXSelectedText" of focusedElement to "{escaped}"
+              set value of attribute "AXSelectedText" of focusedElement to {text_literal}
               return "ok"
             end try
             try
-              keystroke "{escaped}"
+              keystroke {text_literal}
               return "ok"
             end try
             return ""
