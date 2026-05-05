@@ -76,7 +76,7 @@ def active_window_name() -> str:
               return name of frontProcess
             end tell
             """
-        ).lower()
+        )
     return ""
 
 
@@ -163,7 +163,9 @@ def activate_application_process(process_name: str) -> bool:
         f"""
         tell application "System Events"
           try
-            set targetProcess to first application process whose name is "{escaped}"
+            ignoring case
+              set targetProcess to first application process whose name is "{escaped}"
+            end ignoring
             set frontmost of targetProcess to true
             return "ok"
           on error
@@ -171,12 +173,30 @@ def activate_application_process(process_name: str) -> bool:
           end try
         end tell
         """,
-        timeout=0.8,
+        timeout=1.5,
     )
     if result == "ok":
         time.sleep(0.03)
         return True
     return False
+
+
+def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int = 80) -> bool:
+    """Activate the target macOS app and deliver the current clipboard with Cmd+V."""
+    if not IS_MAC:
+        return False
+    target = (process_name or "").strip()
+    if target:
+        current = active_window_name()
+        if current.lower() != target.lower() and not activate_application_process(target):
+            return False
+        deadline = time.time() + 0.8
+        while time.time() < deadline:
+            if active_window_name().lower() == target.lower():
+                break
+            time.sleep(0.03)
+    time.sleep(max(0, int(settle_delay_ms)) / 1000.0)
+    return send_shortcut("cmd+v")
 
 
 def _modifier_clause(parts: list[str]) -> str:
@@ -217,11 +237,21 @@ def send_shortcut(shortcut: str) -> bool:
         "backspace": 51,
     }
     if key in keycodes:
-        script = f'tell application "System Events" to key code {keycodes[key]}{modifiers}'
+        script = f"""
+        tell application "System Events"
+          key code {keycodes[key]}{modifiers}
+          return "ok"
+        end tell
+        """
     else:
         escaped = key.replace("\\", "\\\\").replace('"', '\\"')
-        script = f'tell application "System Events" to keystroke "{escaped}"{modifiers}'
-    return bool(_run_osascript(script, timeout=0.8) or True)
+        script = f"""
+        tell application "System Events"
+          keystroke "{escaped}"{modifiers}
+          return "ok"
+        end tell
+        """
+    return _run_osascript(script, timeout=1.2) == "ok"
 
 
 def type_text(text: str) -> bool:

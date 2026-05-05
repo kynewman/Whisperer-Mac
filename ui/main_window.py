@@ -1117,12 +1117,14 @@ class MainWindow(QMainWindow):
         quoted_url = shlex.quote(asset_url)
         quoted_app = shlex.quote(app_bundle)
         quoted_log = shlex.quote(log_path)
+        quoted_user_data = shlex.quote(get_app_data_dir())
         app_name = shlex.quote(os.path.splitext(os.path.basename(app_bundle))[0] or "Whisperer")
         script = f"""#!/bin/zsh
 set -euo pipefail
 URL={quoted_url}
 APP_BUNDLE={quoted_app}
 APP_NAME={app_name}
+USER_DATA_DIR={quoted_user_data}
 UI_PID={pid}
 LOG={quoted_log}
 TMP_DIR="$(mktemp -d /tmp/whisperer-update.XXXXXX)"
@@ -1131,6 +1133,11 @@ DMG_PATH="$TMP_DIR/update.dmg"
 trap 'hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1 || true; rm -rf "$TMP_DIR"' EXIT
 mkdir -p "$MOUNT_DIR"
 echo "$(date) starting update from $URL" >> "$LOG"
+echo "$(date) preserving user data at $USER_DATA_DIR" >> "$LOG"
+if [[ "$APP_BUNDLE" == "$USER_DATA_DIR"/* ]]; then
+  echo "$(date) refusing update because app bundle is inside user data directory" >> "$LOG"
+  exit 1
+fi
 /usr/bin/curl --fail --location --retry 2 --connect-timeout 15 --max-time 600 --output "$DMG_PATH" "$URL" >> "$LOG" 2>&1
 /usr/bin/hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR" >> "$LOG" 2>&1
 SRC_APP="$(/usr/bin/find "$MOUNT_DIR" -maxdepth 3 -name 'Whisperer.app' -type d -print -quit)"
@@ -1393,7 +1400,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 headers={
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/5.5.5",
+                    "User-Agent": "Whisperer/5.5.6",
                     "Accept": "application/json",
                 },
                 method="GET",
@@ -1621,7 +1628,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 {
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/5.5.5",
+                    "User-Agent": "Whisperer/5.5.6",
                     "Accept": "application/json",
                 },
             ),

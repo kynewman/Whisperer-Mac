@@ -1159,15 +1159,16 @@ class WhisperApp:
             paste_succeeded = 0
             try:
                 with timed("paste_delivery"):
-                    paste_text(
+                    paste_succeeded = 1 if paste_text(
                         formatted,
                         method=paste_method,
                         restore_clipboard=restore_clipboard,
                         auto_send=auto_send,
                         active_app=active_app,
                         paste_delay_ms=paste_delay,
-                    )
-                paste_succeeded = 1
+                    ) else 0
+                if not paste_succeeded:
+                    raise RuntimeError("Paste command was not delivered.")
             except Exception as paste_exc:
                 self.signals.set_status.emit(f"Paste failed: {paste_exc}")
                 time.sleep(1.5)

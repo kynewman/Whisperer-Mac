@@ -40,7 +40,7 @@ NVIDIA_RIVA_FUNCTION_IDS = {
     "parakeet-1.1b-rnnt-multilingual-asr": "71203149-d3b7-4460-8231-1be2543a1fca",
     "parakeet-1.1b-rnnt-multilingual": "71203149-d3b7-4460-8231-1be2543a1fca",
 }
-API_USER_AGENT = "Whisperer/5.5.5"
+API_USER_AGENT = "Whisperer/5.5.6"
 
 
 def _quiet_model_telemetry_logs() -> None:
