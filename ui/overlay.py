@@ -264,13 +264,18 @@ class WaveformOverlay(QWidget):
     def _init_window(self):
         self.setWindowTitle("Whisper Overlay")
         self.setFixedSize(config.OVERLAY_WIDTH, config.OVERLAY_HEIGHT)
-        self.setWindowFlags(
+        flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
+        no_focus_flag = getattr(Qt.WindowType, "WindowDoesNotAcceptFocus", None)
+        if no_focus_flag is not None:
+            flags |= no_focus_flag
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         always_show_tool = getattr(Qt.WidgetAttribute, "WA_MacAlwaysShowToolWindow", None)
         if always_show_tool is not None:
             self.setAttribute(always_show_tool, True)
@@ -367,8 +372,7 @@ class WaveformOverlay(QWidget):
         if self._hovering_interaction_zone and not self._fading_out:
             self._hover_target = 1.0
             self._set_mouse_passthrough(False)
-            self._configure_native_overlay_window(order_front=True)
-            self.raise_()
+            self._bring_forward_without_activating()
             if left_down and not self._left_button_was_down:
                 self._left_button_was_down = True
                 local = QPointF(self.mapFromGlobal(QCursor.pos()))
@@ -524,6 +528,12 @@ class WaveformOverlay(QWidget):
     def _configure_native_overlay_window(self, *, order_front: bool = False):
         if sys.platform == "darwin":
             configure_macos_overlay_window(int(self.winId()), order_front=order_front)
+
+    def _bring_forward_without_activating(self):
+        if sys.platform == "darwin":
+            self._configure_native_overlay_window(order_front=True)
+            return
+        self.raise_()
 
     def _sync_native_glass(self, panel: QRectF | None = None, *, visible: bool | None = None, order_front: bool = False):
         if not self._using_native_liquid_glass():
@@ -897,10 +907,9 @@ class WaveformOverlay(QWidget):
         self._capture_blur_now()
 
         self.show()
-        self._configure_native_overlay_window(order_front=True)
+        self._bring_forward_without_activating()
         self._sync_native_glass(visible=True, order_front=True)
         self._poll_mouse_interaction()
-        self.raise_()
         self._request_blur_refresh(12)
 
     def _grab_macos_window_below(self, screen, x: float, y: float, w: float, h: float, ratio: float) -> QImage:
@@ -1023,9 +1032,8 @@ class WaveformOverlay(QWidget):
         finally:
             if was_visible and sys.platform != "darwin" and request_id == self._blur_request_id:
                 self.show()
-                self._configure_native_overlay_window(order_front=True)
+                self._bring_forward_without_activating()
                 self._sync_native_glass(visible=True, order_front=True)
-                self.raise_()
             if request_id == self._blur_request_id:
                 self._blur_refresh_pending = False
 
@@ -1178,7 +1186,7 @@ class WaveformOverlay(QWidget):
             self._ensure_visual_timers()
             self._poll_mouse_interaction()
             if active:
-                self._configure_native_overlay_window(order_front=True)
+                self._bring_forward_without_activating()
                 self._sync_native_glass(visible=True, order_front=True)
         self.update()
 
@@ -1237,10 +1245,9 @@ class WaveformOverlay(QWidget):
             self._repaint_timer.start(REPAINT_INTERVAL_MS)
             self._start_mouse_polling()
             self.show()
-            self._configure_native_overlay_window(order_front=True)
+            self._bring_forward_without_activating()
             self._sync_native_glass(visible=True, order_front=True)
             self._poll_mouse_interaction()
-            self.raise_()
             self._request_blur_refresh(90)
             self.update()
             return
@@ -1260,10 +1267,9 @@ class WaveformOverlay(QWidget):
             self._fade_anim.setStartValue(self._opacity_effect.opacity())
             self._fade_anim.setEndValue(self._target_opacity)
             self.show()
-            self._configure_native_overlay_window(order_front=True)
+            self._bring_forward_without_activating()
             self._sync_native_glass(visible=True, order_front=True)
             self._poll_mouse_interaction()
-            self.raise_()
             self._fade_anim.start()
             self._request_blur_refresh(80, force=True)
             self.update()
@@ -1319,9 +1325,8 @@ class WaveformOverlay(QWidget):
         self._refresh_mouse_passthrough()
         if self.isVisible():
             if processing:
-                self._configure_native_overlay_window(order_front=True)
+                self._bring_forward_without_activating()
                 self._sync_native_glass(visible=True, order_front=True)
-                self.raise_()
             self._poll_mouse_interaction()
         self.update()
 
@@ -1338,7 +1343,7 @@ class WaveformOverlay(QWidget):
             self._configure_native_overlay_window(order_front=True)
             self._sync_native_glass(visible=True, order_front=True)
             self._repaint_timer.start(REPAINT_INTERVAL_MS)
-            self.raise_()
+            self._bring_forward_without_activating()
             self.update()
         super().changeEvent(event)
 
@@ -1441,7 +1446,7 @@ class WaveformOverlay(QWidget):
         self._fading_out = False
         self.show()
         self._sync_native_glass(visible=True, order_front=True)
-        self.raise_()
+        self._bring_forward_without_activating()
         self._target_opacity = self._load_overlay_opacity()
         self._opacity_effect.setOpacity(self._target_opacity)
         self._set_native_glass_alpha(self._target_opacity)
@@ -1468,7 +1473,7 @@ class WaveformOverlay(QWidget):
         self._fading_out = False
         self.show()
         self._sync_native_glass(visible=True, order_front=True)
-        self.raise_()
+        self._bring_forward_without_activating()
         self._target_opacity = self._load_overlay_opacity()
         self._opacity_effect.setOpacity(self._target_opacity)
         self._set_native_glass_alpha(self._target_opacity)

@@ -310,8 +310,11 @@ def configure_macos_overlay_window(native_handle: int, *, order_front: bool = Fa
             objc.send_long(window, "setLevel:", QT_OVERLAY_LEVEL)
         if objc.responds_to(window, "setCollectionBehavior:"):
             objc.send_ulong(window, "setCollectionBehavior:", 1 | 16 | 64 | 256)
-        if order_front and objc.responds_to(window, "orderFront:"):
-            objc.send_id(window, "orderFront:", None)
+        if order_front:
+            if objc.responds_to(window, "orderFrontRegardless"):
+                objc.send_void(window, "orderFrontRegardless")
+            elif objc.responds_to(window, "orderFront:"):
+                objc.send_id(window, "orderFront:", None)
         return True
     except Exception:
         return False
@@ -491,7 +494,10 @@ class MacLiquidGlassUnderlay:
 
         if visible:
             if order_front or not self._visible:
-                self._objc.send_id(self._window, "orderFront:", None)
+                if self._objc.responds_to(self._window, "orderFrontRegardless"):
+                    self._objc.send_void(self._window, "orderFrontRegardless")
+                else:
+                    self._objc.send_id(self._window, "orderFront:", None)
             self._visible = True
         else:
             self.hide()
