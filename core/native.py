@@ -199,6 +199,46 @@ def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int 
     return send_shortcut("cmd+v")
 
 
+def insert_text_into_focused_control(text: str, process_name: str = "") -> bool:
+    """Insert text directly into the focused macOS control using Accessibility."""
+    if not IS_MAC or not text:
+        return False
+    target = (process_name or "").strip()
+    if target:
+        current = active_window_name()
+        if current.lower() != target.lower() and not activate_application_process(target):
+            return False
+        time.sleep(0.08)
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    result = _run_osascript(
+        f"""
+        tell application "System Events"
+          try
+            set frontProcess to first application process whose frontmost is true
+            set focusedElement to value of attribute "AXFocusedUIElement" of frontProcess
+            try
+              set selected text of focusedElement to "{escaped}"
+              return "ok"
+            end try
+            try
+              set value of attribute "AXSelectedText" of focusedElement to "{escaped}"
+              return "ok"
+            end try
+            try
+              keystroke "{escaped}"
+              return "ok"
+            end try
+            return ""
+          on error
+            return ""
+          end try
+        end tell
+        """,
+        timeout=max(1.5, min(12.0, len(text) / 18.0)),
+    )
+    return result == "ok"
+
+
 def _modifier_clause(parts: list[str]) -> str:
     modifiers = []
     for part in parts:

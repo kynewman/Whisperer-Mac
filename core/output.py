@@ -80,12 +80,14 @@ def paste_text(
         delivered = False
         if sys.platform == "darwin":
             try:
-                from core.native import paste_clipboard_to_application
+                from core.native import insert_text_into_focused_control, paste_clipboard_to_application
 
-                delivered = paste_clipboard_to_application(
-                    active_app,
-                    settle_delay_ms=max(90, paste_delay),
-                )
+                delivered = insert_text_into_focused_control(text, active_app)
+                if not delivered:
+                    delivered = paste_clipboard_to_application(
+                        active_app,
+                        settle_delay_ms=max(90, paste_delay),
+                    )
             except Exception:
                 delivered = False
         else:

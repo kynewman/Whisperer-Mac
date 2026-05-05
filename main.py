@@ -1159,6 +1159,10 @@ class WhisperApp:
             paste_succeeded = 0
             try:
                 with timed("paste_delivery"):
+                    print(
+                        f"PASTE_ATTEMPT app={active_app!r} method={paste_method!r} chars={len(formatted)}",
+                        flush=True,
+                    )
                     paste_succeeded = 1 if paste_text(
                         formatted,
                         method=paste_method,
@@ -1169,7 +1173,9 @@ class WhisperApp:
                     ) else 0
                 if not paste_succeeded:
                     raise RuntimeError("Paste command was not delivered.")
+                print("PASTE_DELIVERED", flush=True)
             except Exception as paste_exc:
+                print(f"PASTE_FAILED {paste_exc}", flush=True)
                 self.signals.set_status.emit(f"Paste failed: {paste_exc}")
                 time.sleep(1.5)
 
