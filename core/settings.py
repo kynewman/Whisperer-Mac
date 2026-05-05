@@ -33,6 +33,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "paste_delay_ms": 30,
         "paste_delay_overrides": {},
         "silence_trim_enabled": True,
+        "streaming_stt_enabled": True,
+        "streaming_finalize_wait_ms": 450,
     },
     "audio": {
         "ducking_enabled": False,

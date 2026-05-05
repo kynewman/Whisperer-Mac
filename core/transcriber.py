@@ -7,12 +7,16 @@ Also supports cloud STT providers.
 from __future__ import annotations
 
 import json
+import hashlib
 import io
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +31,7 @@ from core.settings import load_settings
 
 _model = None
 _warmed_up = False
+_MODEL_LOAD_LOCK = threading.RLock()
 _PARAKEET_WARMUP_TRANSCRIBE = os.environ.get("WHISPERER_PARAKEET_WARMUP_TRANSCRIBE") == "1"
 DEFAULT_OPENAI_STT_MODEL = "gpt-4o-transcribe"
 DEFAULT_GROQ_STT_MODEL = "whisper-large-v3-turbo"
@@ -40,7 +45,9 @@ NVIDIA_RIVA_FUNCTION_IDS = {
     "parakeet-1.1b-rnnt-multilingual-asr": "71203149-d3b7-4460-8231-1be2543a1fca",
     "parakeet-1.1b-rnnt-multilingual": "71203149-d3b7-4460-8231-1be2543a1fca",
 }
-API_USER_AGENT = "Whisperer/5.5.9"
+API_USER_AGENT = "Whisperer/6.0.0"
+_RIVA_CLIENT_CACHE: dict[tuple[str, str, str, str, str], tuple[object, object]] = {}
+_RIVA_CLIENT_LOCK = threading.Lock()
 
 
 def _quiet_model_telemetry_logs() -> None:
@@ -133,55 +140,57 @@ def load_model():
     """Load the selected local STT model once."""
     global _model
     if _model is None:
-        with timed("model_load"):
-            if _is_parakeet_model():
-                _configure_model_cache(config.WHISPER_MODEL_SIZE)
-                try:
-                    import torch
-                    if hasattr(torch, "set_float32_matmul_precision"):
-                        torch.set_float32_matmul_precision("high")
-                    if torch.cuda.is_available():
-                        torch.backends.cudnn.benchmark = True
-                except Exception:
-                    pass
-                try:
-                    with timed("import_nemo_asr"):
-                        import nemo.collections.asr as nemo_asr
-                except Exception as exc:
-                    raise RuntimeError(
-                        "NVIDIA Parakeet requires NeMo ASR. Install it with "
-                        "\"pip install 'nemo_toolkit[asr]'\" in the Whisperer Python environment."
-                    ) from exc
-                _model = nemo_asr.models.ASRModel.from_pretrained(model_name=config.WHISPER_MODEL_SIZE)
-                try:
-                    from omegaconf import OmegaConf
-                    OmegaConf.set_struct(_model.cfg, False)
-                except Exception:
-                    pass
-                if getattr(_model.cfg, "validation_ds", None) is None:
-                    _model.cfg.validation_ds = {}
-                if getattr(_model.cfg, "test_ds", None) is None:
-                    _model.cfg.test_ds = {}
-                if hasattr(_model, "to"):
-                    _model = _model.to(config.WHISPER_DEVICE)
-                if hasattr(_model, "eval"):
-                    _model.eval()
-            else:
-                cached = _configure_model_cache(config.WHISPER_MODEL_SIZE)
-                with timed("import_faster_whisper"):
-                    from faster_whisper import WhisperModel
-                kwargs = {
-                    "device": config.WHISPER_DEVICE,
-                    "compute_type": config.WHISPER_COMPUTE_TYPE,
-                    "download_root": config.MODEL_CACHE_DIR,
-                }
-                if cached:
-                    kwargs["local_files_only"] = True
-                try:
-                    _model = WhisperModel(config.WHISPER_MODEL_SIZE, **kwargs)
-                except TypeError:
-                    kwargs.pop("local_files_only", None)
-                    _model = WhisperModel(config.WHISPER_MODEL_SIZE, **kwargs)
+        with _MODEL_LOAD_LOCK:
+            if _model is None:
+                with timed("model_load"):
+                    if _is_parakeet_model():
+                        _configure_model_cache(config.WHISPER_MODEL_SIZE)
+                        try:
+                            import torch
+                            if hasattr(torch, "set_float32_matmul_precision"):
+                                torch.set_float32_matmul_precision("high")
+                            if torch.cuda.is_available():
+                                torch.backends.cudnn.benchmark = True
+                        except Exception:
+                            pass
+                        try:
+                            with timed("import_nemo_asr"):
+                                import nemo.collections.asr as nemo_asr
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "NVIDIA Parakeet requires NeMo ASR. Install it with "
+                                "\"pip install 'nemo_toolkit[asr]'\" in the Whisperer Python environment."
+                            ) from exc
+                        _model = nemo_asr.models.ASRModel.from_pretrained(model_name=config.WHISPER_MODEL_SIZE)
+                        try:
+                            from omegaconf import OmegaConf
+                            OmegaConf.set_struct(_model.cfg, False)
+                        except Exception:
+                            pass
+                        if getattr(_model.cfg, "validation_ds", None) is None:
+                            _model.cfg.validation_ds = {}
+                        if getattr(_model.cfg, "test_ds", None) is None:
+                            _model.cfg.test_ds = {}
+                        if hasattr(_model, "to"):
+                            _model = _model.to(config.WHISPER_DEVICE)
+                        if hasattr(_model, "eval"):
+                            _model.eval()
+                    else:
+                        cached = _configure_model_cache(config.WHISPER_MODEL_SIZE)
+                        with timed("import_faster_whisper"):
+                            from faster_whisper import WhisperModel
+                        kwargs = {
+                            "device": config.WHISPER_DEVICE,
+                            "compute_type": config.WHISPER_COMPUTE_TYPE,
+                            "download_root": config.MODEL_CACHE_DIR,
+                        }
+                        if cached:
+                            kwargs["local_files_only"] = True
+                        try:
+                            _model = WhisperModel(config.WHISPER_MODEL_SIZE, **kwargs)
+                        except TypeError:
+                            kwargs.pop("local_files_only", None)
+                            _model = WhisperModel(config.WHISPER_MODEL_SIZE, **kwargs)
     return _model
 
 
@@ -190,38 +199,41 @@ def warmup_model() -> None:
     global _warmed_up
     if _warmed_up:
         return
+    with _MODEL_LOAD_LOCK:
+        if _warmed_up:
+            return
 
-    model = load_model()
-    if _is_parakeet_model() and not _PARAKEET_WARMUP_TRANSCRIBE:
+        model = load_model()
+        if _is_parakeet_model() and not _PARAKEET_WARMUP_TRANSCRIBE:
+            with timed("model_warmup"):
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                except Exception:
+                    pass
+            _warmed_up = True
+            return
+
+        silence = np.zeros(config.AUDIO_SAMPLE_RATE // 4, dtype=np.float32)
         with timed("model_warmup"):
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-            except Exception:
-                pass
+            if _is_parakeet_model():
+                _transcribe_parakeet_audio(silence)
+            else:
+                segments, _info = model.transcribe(
+                    silence,
+                    language=config.WHISPER_LANGUAGE,
+                    beam_size=1,
+                    condition_on_previous_text=False,
+                    vad_filter=True,
+                    vad_parameters=dict(
+                        min_silence_duration_ms=300,
+                        speech_pad_ms=100,
+                    ),
+                )
+                for _segment in segments:
+                    pass
         _warmed_up = True
-        return
-
-    silence = np.zeros(config.AUDIO_SAMPLE_RATE // 4, dtype=np.float32)
-    with timed("model_warmup"):
-        if _is_parakeet_model():
-            _transcribe_parakeet_audio(silence)
-        else:
-            segments, _info = model.transcribe(
-                silence,
-                language=config.WHISPER_LANGUAGE,
-                beam_size=1,
-                condition_on_previous_text=False,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=300,
-                    speech_pad_ms=100,
-                ),
-            )
-            for _segment in segments:
-                pass
-    _warmed_up = True
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +537,11 @@ def _nvidia_model_id(model: str | None) -> str:
     return aliases.get(cleaned, cleaned)
 
 
+def nvidia_riva_model_supports_streaming(model: str | None) -> bool:
+    """Hosted Parakeet TDT 0.6B is offline-only; RNNT is the streaming path."""
+    return "rnnt" in _nvidia_model_id(model).lower()
+
+
 def _nvidia_hosted_uri(base_url: str | None) -> str:
     raw = (base_url or "").strip()
     if not raw:
@@ -576,13 +593,30 @@ def _riva_response_text(response) -> str:
     return " ".join(parts).strip()
 
 
-def _transcribe_nvidia_riva_hosted(
-    audio: np.ndarray,
+def _riva_result_text(result) -> str:
+    alternatives = getattr(result, "alternatives", []) or []
+    if not alternatives:
+        return ""
+    return str(getattr(alternatives[0], "transcript", "") or "").strip()
+
+
+def _riva_cache_key(api_key: str | None, base_url: str | None, language: str | None, model_id: str) -> tuple[str, str, str, str, str]:
+    key_hash = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
+    return (
+        _nvidia_hosted_uri(base_url),
+        NVIDIA_RIVA_FUNCTION_IDS.get(model_id, ""),
+        _nvidia_language_code(language, model_id),
+        model_id,
+        key_hash,
+    )
+
+
+def _get_riva_service_and_config(
     api_key: str | None,
-    base_url: str | None = None,
+    base_url: str | None,
     language: str = "en",
     model: str | None = None,
-) -> str:
+) -> tuple[object, object]:
     if not api_key:
         raise RuntimeError("NVIDIA API key is required for the hosted Parakeet API.")
 
@@ -590,6 +624,12 @@ def _transcribe_nvidia_riva_hosted(
     function_id = NVIDIA_RIVA_FUNCTION_IDS.get(model_id)
     if not function_id:
         raise RuntimeError(f"Unsupported NVIDIA Parakeet API model: {model_id}")
+
+    cache_key = _riva_cache_key(api_key, base_url, language, model_id)
+    with _RIVA_CLIENT_LOCK:
+        cached = _RIVA_CLIENT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
     try:
         import riva.client
@@ -611,7 +651,7 @@ def _transcribe_nvidia_riva_hosted(
             ("grpc.max_receive_message_length", 50 * 1024 * 1024),
         ],
     )
-    config = riva.client.RecognitionConfig(
+    recognition_config = riva.client.RecognitionConfig(
         encoding=raudio.LINEAR_PCM,
         sample_rate_hertz=16000,
         language_code=_nvidia_language_code(language, model_id),
@@ -620,8 +660,157 @@ def _transcribe_nvidia_riva_hosted(
         enable_automatic_punctuation=True,
     )
     service = riva.client.ASRService(auth)
+    value = (service, recognition_config)
+    with _RIVA_CLIENT_LOCK:
+        _RIVA_CLIENT_CACHE[cache_key] = value
+    return value
+
+
+def prewarm_nvidia_riva(
+    api_key: str | None,
+    base_url: str | None = None,
+    language: str = "en",
+    models: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> int:
+    """Import/cache hosted NVIDIA Riva clients before the first dictation needs them."""
+    if not api_key:
+        return 0
+    warmed = 0
+    for model in models or (DEFAULT_NVIDIA_NIM_STT_MODEL,):
+        _get_riva_service_and_config(api_key, base_url, language=language, model=model)
+        warmed += 1
+    return warmed
+
+
+class NvidiaStreamingTranscriber:
+    """Low-latency NVIDIA Riva streaming ASR session for push-to-talk dictation."""
+
+    def __init__(
+        self,
+        api_key: str | None,
+        base_url: str | None = None,
+        language: str = "en",
+        model: str | None = None,
+        text_callback=None,
+    ):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.language = language
+        self.model = model
+        self.text_callback = text_callback
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=128)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._final_parts: list[str] = []
+        self._partial_text = ""
+        self._best_text = ""
+        self._error = ""
+        self._started_at = 0.0
+
+    def start(self) -> bool:
+        if self._thread is not None:
+            return True
+        self._stop_event.clear()
+        self._started_at = time.perf_counter()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def feed_audio(self, float_array: np.ndarray) -> None:
+        if self._stop_event.is_set() or float_array is None or len(float_array) == 0:
+            return
+        try:
+            self._queue.put_nowait(float_array.astype(np.float32, copy=True))
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(float_array.astype(np.float32, copy=True))
+            except queue.Full:
+                pass
+
+    def finish(self, timeout_s: float = 0.75) -> str:
+        self._stop_event.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=max(0.0, timeout_s))
+        with self._lock:
+            return self._best_text.strip()
+
+    @property
+    def error(self) -> str:
+        with self._lock:
+            return self._error
+
+    def _audio_chunks(self):
+        while not self._stop_event.is_set() or not self._queue.empty():
+            try:
+                item = self._queue.get(timeout=0.08)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            yield _audio_to_pcm16_bytes(item)
+
+    def _run(self) -> None:
+        try:
+            import riva.client
+
+            service, recognition_config = _get_riva_service_and_config(
+                self.api_key,
+                self.base_url,
+                language=self.language,
+                model=self.model,
+            )
+            streaming_config = riva.client.StreamingRecognitionConfig(
+                config=recognition_config,
+                interim_results=True,
+            )
+            for response in service.streaming_response_generator(self._audio_chunks(), streaming_config):
+                for result in getattr(response, "results", []) or []:
+                    text = _riva_result_text(result)
+                    if not text:
+                        continue
+                    with self._lock:
+                        if bool(getattr(result, "is_final", False)):
+                            self._final_parts.append(text)
+                            self._partial_text = ""
+                        else:
+                            self._partial_text = text
+                        self._best_text = " ".join([*self._final_parts, self._partial_text]).strip()
+                        current = self._best_text
+                    if current and self.text_callback:
+                        self.text_callback(current)
+        except Exception as exc:
+            with self._lock:
+                self._error = str(exc)
+        finally:
+            elapsed_ms = (time.perf_counter() - self._started_at) * 1000.0 if self._started_at else 0.0
+            try:
+                from core.perf import record_timing
+
+                record_timing("transcribe_nvidia_streaming_session", elapsed_ms)
+            except Exception:
+                pass
+
+
+def _transcribe_nvidia_riva_hosted(
+    audio: np.ndarray,
+    api_key: str | None,
+    base_url: str | None = None,
+    language: str = "en",
+    model: str | None = None,
+) -> str:
+    service, recognition_config = _get_riva_service_and_config(api_key, base_url, language=language, model=model)
     with timed("transcribe_nvidia_riva"):
-        response = service.offline_recognize(_audio_to_pcm16_bytes(audio), config)
+        response = service.offline_recognize(_audio_to_pcm16_bytes(audio), recognition_config)
     return _riva_response_text(response)
 
 

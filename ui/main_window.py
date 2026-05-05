@@ -1400,7 +1400,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 headers={
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/5.5.9",
+                    "User-Agent": "Whisperer/6.0.0",
                     "Accept": "application/json",
                 },
                 method="GET",
@@ -1628,7 +1628,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 {
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/5.5.9",
+                    "User-Agent": "Whisperer/6.0.0",
                     "Accept": "application/json",
                 },
             ),

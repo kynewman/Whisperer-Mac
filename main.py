@@ -72,7 +72,14 @@ from PyQt6.QtCore import QTimer, pyqtSignal, QObject
 from PyQt6.QtWidgets import QApplication
 
 from core.audio import AudioRecorder
-from core.transcriber import load_model, transcribe, warmup_model
+from core.transcriber import (
+    NvidiaStreamingTranscriber,
+    load_model,
+    nvidia_riva_model_supports_streaming,
+    prewarm_nvidia_riva,
+    transcribe,
+    warmup_model,
+)
 from core.context import (
     capture_clipboard_context,
     capture_screen_context,
@@ -346,7 +353,7 @@ class WhisperApp:
         self._clear_longform_lock()
         active_app, window_title = self._consume_pending_active_target()
         if not active_app and not window_title:
-            active_app, window_title = self._capture_active_target()
+            active_app, window_title = self._capture_active_target(include_title=False)
         self._prime_listening_overlay()
         if longform_requested:
             self._request_longform_lock()
@@ -428,15 +435,17 @@ class WhisperApp:
         if not self._modes_list:
             self._modes_list = [get_mode_by_name("Voice") or resolve_active_mode()]
 
-    def _capture_active_target(self) -> tuple[str, str]:
+    def _capture_active_target(self, *, include_title: bool = True) -> tuple[str, str]:
         try:
-            return get_active_window_name(), get_active_window_title()
+            active_app = get_active_window_name()
+            window_title = get_active_window_title() if include_title else ""
+            return active_app, window_title
         except Exception:
             return "", ""
 
     def _store_pending_active_target(self, active_app: str = "", window_title: str = "") -> tuple[str, str]:
         if not active_app and not window_title:
-            active_app, window_title = self._capture_active_target()
+            active_app, window_title = self._capture_active_target(include_title=False)
         with self._pending_active_target_lock:
             self._pending_active_app = active_app or ""
             self._pending_window_title = window_title or ""
@@ -475,6 +484,7 @@ class WhisperApp:
         thread: threading.Thread | None,
         *,
         timeout: float = 0.25,
+        fallback: bool = True,
     ) -> tuple[str, str]:
         if thread is not None:
             thread.join(timeout=timeout)
@@ -482,7 +492,206 @@ class WhisperApp:
         window_title = (result or {}).get("window_title", "")
         if active_app or window_title:
             return active_app, window_title
+        if not fallback:
+            return "", ""
         return self._capture_active_target()
+
+    def _needs_prompt_context(self, mode, context_mode: str) -> bool:
+        if context_mode == "off":
+            return False
+        parakeet_local = (
+            (mode.stt_provider or "local") == "local"
+            and config.WHISPER_MODEL_SIZE.lower().startswith("nvidia/parakeet")
+        )
+        return not (parakeet_local and not mode.llm_enabled)
+
+    def _begin_context_prefetch(
+        self,
+        mode,
+        settings: dict,
+        active_app: str,
+    ) -> dict:
+        perf_cfg = settings.get("performance", {})
+        context_mode = str(perf_cfg.get("context_mode", "fast")).lower()
+        prefetch = {
+            "mode": context_mode,
+            "results": {},
+            "threads": [],
+            "vocab_thread": None,
+            "vocab": "",
+        }
+        if not self._needs_prompt_context(mode, context_mode):
+            return prefetch
+
+        results = prefetch["results"]
+
+        def _collect(name: str, fn):
+            try:
+                with timed(f"context_{name}"):
+                    results[name] = fn()
+            except Exception:
+                results[name] = ""
+
+        def _start(name: str, fn):
+            thread = threading.Thread(target=lambda: _collect(name, fn), daemon=True)
+            prefetch["threads"].append(thread)
+            thread.start()
+
+        full_context = context_mode == "full"
+        if mode.ctx_ocr:
+            ocr_fn = capture_screen_context if full_context else lambda: capture_screen_context_cached(blocking=False)
+            _start("ocr", ocr_fn)
+        if mode.ctx_selected_text and full_context:
+            _start("selected_text", capture_selected_text)
+        if mode.ctx_clipboard:
+            _start("clipboard", capture_clipboard_context)
+        if context_mode != "off":
+            _start("ui_automation", lambda: capture_ui_automation_text(app_name=active_app))
+
+        try:
+            vocab_limit = int(settings.get("dictation", {}).get("vocabulary_prompt_limit", 80))
+        except (TypeError, ValueError):
+            vocab_limit = 80
+        if vocab_limit > 0:
+            def _collect_vocab():
+                try:
+                    with timed("dictionary_prompt"):
+                        prefetch["vocab"] = get_prompt_words(vocab_limit)
+                except Exception:
+                    prefetch["vocab"] = ""
+
+            vocab_thread = threading.Thread(target=_collect_vocab, daemon=True)
+            prefetch["vocab_thread"] = vocab_thread
+            vocab_thread.start()
+        return prefetch
+
+    def _finish_context_prefetch(self, prefetch: dict, *, wait_s: float) -> tuple[dict[str, str], str]:
+        deadline = time.time() + max(0.0, wait_s)
+        for thread in prefetch.get("threads", []):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        vocab_thread = prefetch.get("vocab_thread")
+        if vocab_thread is not None:
+            remaining = deadline - time.time()
+            if remaining > 0:
+                vocab_thread.join(timeout=remaining)
+        results = dict(prefetch.get("results", {}))
+        vocab = str(prefetch.get("vocab", "") or "")
+        return results, vocab
+
+    def _start_streaming_stt_if_available(
+        self,
+        stt_provider: str,
+        stt_model: str,
+        mode,
+        settings: dict,
+    ):
+        perf_cfg = settings.get("performance", {})
+        if not bool(perf_cfg.get("streaming_stt_enabled", True)):
+            return None
+        if stt_provider != "nvidia_nim_parakeet":
+            return None
+        if not nvidia_riva_model_supports_streaming(stt_model):
+            print(f"STREAMING_STT_SKIPPED model={stt_model!r} offline_only=True", flush=True)
+            return None
+        from core.secrets import get_key
+
+        key = get_key("nvidia")
+        if not key:
+            return None
+        session = NvidiaStreamingTranscriber(
+            key,
+            base_url=settings.get("stt", {}).get("nvidia_nim_url", ""),
+            language=mode.language or config.WHISPER_LANGUAGE,
+            model=stt_model,
+            text_callback=lambda text: self.signals.set_transcribed_text.emit(text),
+        )
+        try:
+            session.start()
+            self.recorder.add_audio_consumer(session)
+            print("STREAMING_STT_STARTED provider='nvidia_nim_parakeet'", flush=True)
+            return session
+        except Exception as exc:
+            print(f"STREAMING_STT_UNAVAILABLE {exc}", flush=True)
+            return None
+
+    def _finish_streaming_stt(self, session, wait_s: float = 0.75) -> str:
+        if session is None:
+            return ""
+        self.recorder.remove_audio_consumer(session)
+        with timed("transcribe_streaming_finalize"):
+            text = session.finish(timeout_s=wait_s)
+        error = getattr(session, "error", "")
+        if error:
+            print(f"STREAMING_STT_FAILED {error}", flush=True)
+        if text:
+            print(f"STREAMING_STT_READY chars={len(text)}", flush=True)
+        return text
+
+    def _prewarm_cloud_stt_clients(self, settings: dict) -> None:
+        """Hide cloud SDK imports/client setup behind startup idle time."""
+        try:
+            perf_cfg = settings.get("performance", {})
+            if not bool(perf_cfg.get("streaming_stt_enabled", True)):
+                return
+            from core.secrets import get_key
+
+            key = get_key("nvidia")
+            if not key:
+                return
+            models = {
+                _stt_model_name("nvidia_nim_parakeet", mode.stt_model)
+                for mode in list_modes(enabled_only=True)
+                if (mode.stt_provider or "") == "nvidia_nim_parakeet"
+            }
+            if not models:
+                models.add(_stt_model_name("nvidia_nim_parakeet"))
+            warmed = prewarm_nvidia_riva(
+                key,
+                base_url=settings.get("stt", {}).get("nvidia_nim_url", ""),
+                models=models,
+            )
+            if warmed:
+                print(f"NVIDIA_RIVA_PREWARM_READY models={warmed}", flush=True)
+        except Exception as exc:
+            print(f"NVIDIA_RIVA_PREWARM_SKIPPED {exc}", flush=True)
+
+    def _wait_until_engine_idle(self, idle_s: float = 6.0, max_wait_s: float = 90.0) -> bool:
+        deadline = time.monotonic() + max_wait_s
+        idle_started = 0.0
+        while self._running and time.monotonic() < deadline:
+            busy = self.recorder.is_recording or self._session_lock.locked() or self._processing_job_active.is_set()
+            now = time.monotonic()
+            if not busy:
+                if idle_started <= 0:
+                    idle_started = now
+                if now - idle_started >= idle_s:
+                    return True
+            else:
+                idle_started = 0.0
+            time.sleep(0.2)
+        return self._running
+
+    def _warm_local_model_when_idle(self, model_name: str, settings: dict) -> None:
+        perf_cfg = settings.get("performance", {})
+        if perf_cfg.get("engine_preload", "app_start") == "off":
+            print("LOCAL_MODEL_WARMUP_SKIPPED preload_off", flush=True)
+            return
+        if not self._wait_until_engine_idle():
+            return
+        engine_name = "NVIDIA Parakeet" if model_name.lower().startswith("nvidia/parakeet") else "Whisper"
+        target = "GPU" if config.WHISPER_DEVICE == "cuda" else config.WHISPER_DEVICE.upper()
+        print(f"Warming {engine_name} local fallback on {target}...", flush=True)
+        try:
+            with timed("engine_startup_model_phase"):
+                load_model()
+                warmup_model()
+            print(f"LOCAL_MODEL_READY {model_name}", flush=True)
+        except Exception as exc:
+            self._model_failed = str(exc)
+            print(f"LOCAL_MODEL_WARMUP_FAILED {exc}", flush=True)
 
     def _on_mode_changed_overlay(self, mode_name: str):
         """Show a brief mode-change notification in the overlay."""
@@ -715,7 +924,7 @@ class WhisperApp:
             self._request_longform_lock()
             active_app, window_title = self._consume_pending_active_target()
             if not active_app and not window_title:
-                active_app, window_title = self._capture_active_target()
+                active_app, window_title = self._capture_active_target(include_title=False)
             self._prime_listening_overlay()
             threading.Thread(
                 target=lambda: self._run_one_dictation_session(
@@ -874,21 +1083,46 @@ class WhisperApp:
         contexts: dict[str, str] = {}
         stt_provider = "local"
         stt_model = _stt_model_name(stt_provider)
+        settings = load_settings()
+        context_prefetch: dict | None = None
+        streaming_session = None
+        streaming_provider = ""
+        streaming_model = ""
         active_capture: dict[str, str] | None = None
         active_capture_thread: threading.Thread | None = None
 
         try:
             if not self._running:
                 return
+            if not active_app and not window_title:
+                active_app, window_title = self._capture_active_target(include_title=False)
+            if not window_title:
+                active_capture, active_capture_thread = self._begin_active_target_capture()
+            try:
+                mode = resolve_active_mode(active_app, window_title)
+            except Exception:
+                mode = resolve_active_mode()
+            mode_id = mode.id
+            self.signals.set_mode.emit(mode.name)
+            stt_provider = mode.stt_provider or "local"
+            stt_model = _stt_model_name(stt_provider, mode.stt_model)
             if not overlay_primed:
                 self._prime_listening_overlay()
-            if not active_app and not window_title:
-                active_capture, active_capture_thread = self._begin_active_target_capture()
 
             try:
                 with timed("recorder_start"):
-                    self.recorder.refresh_settings(load_settings())
+                    self.recorder.refresh_settings(settings)
+                    streaming_session = self._start_streaming_stt_if_available(
+                        stt_provider,
+                        stt_model,
+                        mode,
+                        settings,
+                    )
+                    if streaming_session is not None:
+                        streaming_provider = stt_provider
+                        streaming_model = stt_model
                     self.recorder.start()
+                    context_prefetch = self._begin_context_prefetch(mode, settings, active_app)
                 if self._is_alt_pressed():
                     self._request_longform_lock()
             except Exception as exc:
@@ -915,6 +1149,8 @@ class WhisperApp:
                 if longform is None:  # cancelled
                     with timed("recorder_stop_cancelled"):
                         audio = self.recorder.stop()
+                    self._finish_streaming_stt(streaming_session, wait_s=0.05)
+                    streaming_session = None
                     self._restore_audio_ducking()
                     self.signals.set_active.emit(False)
                     self.signals.set_locked.emit(False)
@@ -942,6 +1178,8 @@ class WhisperApp:
             if self._cancelled:
                 with timed("recorder_stop_cancelled"):
                     audio = self.recorder.stop()
+                self._finish_streaming_stt(streaming_session, wait_s=0.05)
+                streaming_session = None
                 print("MIC_LEVEL -96.0 0.0000", flush=True)
                 self._restore_audio_ducking()
                 self.signals.set_active.emit(False)
@@ -966,9 +1204,33 @@ class WhisperApp:
             if self._live_recognizer:
                 self._live_recognizer.stop()
 
+            if active_capture_thread is not None:
+                captured_app, captured_title = self._finish_active_target_capture(
+                    active_capture,
+                    active_capture_thread,
+                    timeout=0.03,
+                    fallback=False,
+                )
+                if captured_app and not active_app:
+                    active_app = captured_app
+                if captured_title:
+                    window_title = captured_title
+                    try:
+                        updated_mode = resolve_active_mode(active_app, window_title)
+                        if updated_mode.id != mode_id:
+                            mode = updated_mode
+                            mode_id = mode.id
+                            self.signals.set_mode.emit(mode.name)
+                            stt_provider = mode.stt_provider or "local"
+                            stt_model = _stt_model_name(stt_provider, mode.stt_model)
+                    except Exception:
+                        pass
+
             duration_ms = int((time.time() - t0) * 1000)
 
             if len(audio) < config.AUDIO_SAMPLE_RATE * 0.3 or _looks_silent(audio):
+                self._finish_streaming_stt(streaming_session, wait_s=0.05)
+                streaming_session = None
                 self.signals.set_processing.emit(False)
                 self.signals.set_status.emit("No speech detected.")
                 time.sleep(0.3)
@@ -976,74 +1238,22 @@ class WhisperApp:
                 return
 
             self._processing_job_active.set()
-            if not active_app and not window_title:
-                active_app, window_title = self._finish_active_target_capture(
-                    active_capture,
-                    active_capture_thread,
-                )
-
-            try:
-                mode = resolve_active_mode(active_app, window_title)
-            except Exception:
-                mode = resolve_active_mode()
-            mode_id = mode.id
-            self.signals.set_mode.emit(mode.name)
-            stt_provider = mode.stt_provider or "local"
-            stt_model = _stt_model_name(stt_provider, mode.stt_model)
-            settings = load_settings()
             perf_cfg = settings.get("performance", {})
             context_mode = str(perf_cfg.get("context_mode", "fast")).lower()
-            parakeet_local = (
-                stt_provider == "local"
-                and config.WHISPER_MODEL_SIZE.lower().startswith("nvidia/parakeet")
-            )
-            needs_prompt_context = context_mode != "off" and not (parakeet_local and not mode.llm_enabled)
-
-            context_threads: list[threading.Thread] = []
-            results: dict[str, str] = {}
-
-            def _collect(name: str, fn):
-                try:
-                    with timed(f"context_{name}"):
-                        results[name] = fn()
-                except Exception:
-                    results[name] = ""
-
-            if needs_prompt_context:
-                full_context = context_mode == "full"
-                if mode.ctx_ocr:
-                    ocr_fn = capture_screen_context if full_context else lambda: capture_screen_context_cached(blocking=False)
-                    t = threading.Thread(target=lambda: _collect("ocr", ocr_fn), daemon=True)
-                    context_threads.append(t)
-                    t.start()
-                if mode.ctx_selected_text and full_context:
-                    t = threading.Thread(target=lambda: _collect("selected_text", capture_selected_text), daemon=True)
-                    context_threads.append(t)
-                    t.start()
-                if mode.ctx_clipboard:
-                    t = threading.Thread(target=lambda: _collect("clipboard", capture_clipboard_context), daemon=True)
-                    context_threads.append(t)
-                    t.start()
-                t = threading.Thread(target=lambda: _collect("ui_automation", capture_ui_automation_text), daemon=True)
-                context_threads.append(t)
-                t.start()
-
             self.signals.set_status.emit("Transcribing...")
-            # Keep context helpful without letting slow OCR/clipboard work block STT.
-            context_budget = 0.25 if context_mode == "full" else 0.06
-            context_deadline = time.time() + context_budget
-            for t in context_threads:
-                remaining = context_deadline - time.time()
-                if remaining <= 0:
-                    break
-                t.join(timeout=remaining)
-            contexts.update(results)
-
-            vocab_limit = settings.get("dictation", {}).get("vocabulary_prompt_limit", 80)
-            vocab_hints = ""
-            if needs_prompt_context:
-                with timed("dictionary_prompt"):
-                    vocab_hints = get_prompt_words(vocab_limit)
+            context_budget = 0.35 if context_mode == "full" else 0.015
+            if context_prefetch is None:
+                context_prefetch = self._begin_context_prefetch(mode, settings, active_app)
+            prefetched_contexts, vocab_hints = self._finish_context_prefetch(context_prefetch, wait_s=context_budget)
+            contexts.update(prefetched_contexts)
+            streaming_text = ""
+            if streaming_session is not None:
+                if stt_provider == streaming_provider and stt_model == streaming_model:
+                    wait_ms = int(perf_cfg.get("streaming_finalize_wait_ms", 450))
+                    streaming_text = self._finish_streaming_stt(streaming_session, wait_s=max(0.05, wait_ms / 1000.0))
+                else:
+                    self._finish_streaming_stt(streaming_session, wait_s=0.05)
+                streaming_session = None
 
             # Build context prompt for cloud/local
             prompt_parts: list[str] = []
@@ -1069,7 +1279,10 @@ class WhisperApp:
             raw_text = ""
             try:
                 with timed("dictation_transcribe_total"):
-                    if stt_provider == "local":
+                    if streaming_text:
+                        raw_text = streaming_text
+                        print("STREAMING_STT_USED", flush=True)
+                    elif stt_provider == "local":
                         raw_text = _local_transcribe()
                     else:
                         # Cloud STT; fall back locally so a missing key or transient
@@ -1257,6 +1470,11 @@ class WhisperApp:
                 daemon=True,
             ).start()
         finally:
+            if streaming_session is not None:
+                try:
+                    self._finish_streaming_stt(streaming_session, wait_s=0.05)
+                except Exception:
+                    pass
             self._restore_audio_ducking()
             self._processing_job_active.clear()
             self._clear_longform_lock()
@@ -1275,7 +1493,7 @@ class WhisperApp:
         if not self._session_lock.acquire(blocking=False):
             return
         self._clear_longform_lock()
-        active_app, window_title = self._capture_active_target()
+        active_app, window_title = self._capture_active_target(include_title=False)
         if active_app or window_title:
             print(f"DICTATION_TARGET_CAPTURED app={active_app!r} title={window_title!r}", flush=True)
         self._prime_listening_overlay()
@@ -1307,7 +1525,7 @@ class WhisperApp:
         if not self._session_lock.acquire(blocking=False):
             return
         self._clear_longform_lock()
-        active_app, window_title = self._capture_active_target()
+        active_app, window_title = self._capture_active_target(include_title=False)
         if active_app or window_title:
             print(f"DICTATION_TARGET_CAPTURED app={active_app!r} title={window_title!r}", flush=True)
         self._prime_listening_overlay()
@@ -1450,16 +1668,12 @@ class WhisperApp:
         model_name = config.WHISPER_MODEL_SIZE
         engine_name = "NVIDIA Parakeet" if model_name.lower().startswith("nvidia/parakeet") else "Whisper"
         target = "GPU" if config.WHISPER_DEVICE == "cuda" else config.WHISPER_DEVICE.upper()
-        print(f"Loading {engine_name} model on {target}...", flush=True)
+        print(f"Preparing dictation engine with {engine_name} local fallback on {target}...", flush=True)
 
         try:
-            with timed("engine_startup_model_phase"):
-                load_model()
-                warmup_model()
-            print(f"Model loaded. Whisper Project is running with {model_name}.", flush=True)
-
+            settings = load_settings()
             try:
-                self.recorder.refresh_settings(load_settings())
+                self.recorder.refresh_settings(settings)
                 with timed("recorder_prepare"):
                     self.recorder.prepare()
             except Exception as exc:
@@ -1473,7 +1687,6 @@ class WhisperApp:
             self._ensure_live_recognizer()
             if not self._start_pre_ready_hotkey_dictation_if_held():
                 threading.Thread(target=self._clear_pre_ready_hotkey_after_release, daemon=True).start()
-            settings = load_settings()
             shortcuts = settings.get("shortcuts", {})
             dictation_hk = _normalize_keyboard_hotkey(shortcuts.get("dictation") or config.DICTATION_HOTKEY) or config.DICTATION_HOTKEY
             print(f"Quick dictation:  {dictation_hk.replace('+', ' + ').title()} (hold)", flush=True)
@@ -1484,6 +1697,8 @@ class WhisperApp:
                 print(f"Cancel:           {shortcuts['cancel'].replace('+', ' + ').title()}", flush=True)
             print("Press Ctrl+C in this terminal to quit.\n", flush=True)
             threading.Timer(1.2, self._hide_loading_overlay_if_idle).start()
+            threading.Thread(target=lambda: self._prewarm_cloud_stt_clients(settings), daemon=True).start()
+            threading.Thread(target=lambda: self._warm_local_model_when_idle(model_name, settings), daemon=True).start()
         except Exception as exc:
             self._model_failed = str(exc)
             self.signals.set_model_loading.emit(False)

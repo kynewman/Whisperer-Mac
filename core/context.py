@@ -277,10 +277,10 @@ def mark_clipboard_pasted():
 # Focused-control text
 # ---------------------------------------------------------------------------
 
-def capture_ui_automation_text(hwnd: int | None = None) -> str:
+def capture_ui_automation_text(hwnd: int | None = None, app_name: str = "") -> str:
     """Pull focused-control text where the platform exposes it. Falls back to ''."""
     if sys.platform == "darwin":
-        return native.focused_control_text()
+        return native.focused_control_text(app_name)
     if os.name != "nt":
         return ""
     try:

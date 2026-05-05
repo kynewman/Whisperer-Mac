@@ -58,12 +58,28 @@ class AudioRecorder:
         self._max_input_channels = config.AUDIO_CHANNELS
         self._last_probe_key = None
         self._lock = threading.Lock()
+        self._consumer_lock = threading.Lock()
+        self._audio_consumers: list[object] = []
         self._backup_lock = threading.Lock()
         self._backup_file = None
         self._backup_bytes_written = 0
         self._recording = False
         self.live_recognizer = live_recognizer
         self.refresh_settings(load_settings())
+
+    def add_audio_consumer(self, consumer: object) -> None:
+        if consumer is None:
+            return
+        with self._consumer_lock:
+            if consumer not in self._audio_consumers:
+                self._audio_consumers.append(consumer)
+
+    def remove_audio_consumer(self, consumer: object) -> None:
+        with self._consumer_lock:
+            try:
+                self._audio_consumers.remove(consumer)
+            except ValueError:
+                pass
 
     @property
     def is_recording(self) -> bool:
@@ -152,6 +168,15 @@ class AudioRecorder:
 
         if self.live_recognizer:
             self.live_recognizer.feed_audio(flat)
+        with self._consumer_lock:
+            consumers = tuple(self._audio_consumers)
+        for consumer in consumers:
+            try:
+                feed_audio = getattr(consumer, "feed_audio", None)
+                if callable(feed_audio):
+                    feed_audio(flat)
+            except Exception:
+                pass
 
     def _start_backup_cache(self):
         raw_path = reset_last_dictation_backup()

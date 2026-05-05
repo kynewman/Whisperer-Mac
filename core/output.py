@@ -112,7 +112,7 @@ def paste_text(
                     print("PASTE_WARNING accessibility_not_trusted", flush=True)
                 delivered = paste_clipboard_to_application(
                     active_app,
-                    settle_delay_ms=max(140, paste_delay),
+                    settle_delay_ms=max(75, paste_delay),
                 )
                 if not delivered:
                     delivered = insert_text_into_focused_control(text, active_app)

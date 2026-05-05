@@ -246,13 +246,23 @@ def active_window_rect() -> tuple[int, int, int, int] | None:
     return (left, top, right, bottom)
 
 
-def focused_control_text() -> str:
+def focused_control_text(process_name: str = "") -> str:
     if not IS_MAC:
         return ""
-    return _run_osascript(
+    target = (process_name or "").strip()
+    if target:
+        escaped = target.replace("\\", "\\\\").replace('"', '\\"')
+        process_clause = f"""
+          ignoring case
+            set frontProcess to first application process whose name is "{escaped}"
+          end ignoring
         """
+    else:
+        process_clause = '          set frontProcess to first application process whose frontmost is true'
+    return _run_osascript(
+        f"""
         tell application "System Events"
-          set frontProcess to first application process whose frontmost is true
+{process_clause}
           try
             set focusedElement to value of attribute "AXFocusedUIElement" of frontProcess
             set outText to ""
