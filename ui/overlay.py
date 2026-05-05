@@ -1722,19 +1722,32 @@ class WaveformOverlay(QWidget):
             painter.setPen(QPen(QColor(210, 226, 255, int(34 * glow)), 1.05))
             painter.drawPath(path)
 
-        border = QLinearGradient(panel.left(), panel.top(), panel.right(), panel.bottom())
         if self._state == "error":
+            border = QLinearGradient(panel.left(), panel.top(), panel.right(), panel.bottom())
             border.setColorAt(0.0, QColor(255, 80, 80, 60))
             border.setColorAt(0.5, QColor(255, 60, 60, 30))
             border.setColorAt(1.0, QColor(255, 40, 40, 15))
+            border_pen = QPen(QBrush(border), 1.05)
         else:
             lock = self._lock_glow
-            border.setColorAt(0.0, QColor(255, 255, 255, int(42 + 42 * lock)))
-            border.setColorAt(0.45, QColor(220, 234, 255, int(20 + 58 * lock)))
-            border.setColorAt(1.0, QColor(120, 168, 255, int(10 + 42 * lock)))
-        painter.setPen(QPen(QBrush(border), 1.05 + 0.48 * self._lock_glow))
+            if lock > 0.01:
+                border = QLinearGradient(panel.left(), panel.top(), panel.right(), panel.bottom())
+                border.setColorAt(0.0, QColor(255, 255, 255, int(42 + 42 * lock)))
+                border.setColorAt(0.45, QColor(220, 234, 255, int(20 + 58 * lock)))
+                border.setColorAt(1.0, QColor(120, 168, 255, int(10 + 42 * lock)))
+                border_pen = QPen(QBrush(border), 1.05 + 0.48 * lock)
+            else:
+                border_pen = QPen(QColor(246, 249, 255, 32), 1.05)
+        border_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        border_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(border_pen)
         painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-        painter.drawPath(path)
+        inset = max(0.5, border_pen.widthF() / 2.0)
+        outline = panel.adjusted(inset, inset, -inset, -inset)
+        outline_radius = outline.height() / 2
+        outline_path = QPainterPath()
+        outline_path.addRoundedRect(outline, outline_radius, outline_radius)
+        painter.drawPath(outline_path)
 
     def _draw_drag_handle(self, painter: QPainter, panel: QRectF):
         progress = max(self._hover_icon_progress, 1.0 if self._dragging else 0.0)
