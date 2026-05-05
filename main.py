@@ -73,9 +73,11 @@ from PyQt6.QtWidgets import QApplication
 
 from core.audio import AudioRecorder
 from core.transcriber import (
+    NVIDIA_RIVA_STREAMING_MODEL,
     NvidiaStreamingTranscriber,
     load_model,
     nvidia_riva_model_supports_streaming,
+    nvidia_riva_streaming_model,
     prewarm_nvidia_riva,
     transcribe,
     warmup_model,
@@ -596,6 +598,7 @@ class WhisperApp:
         if not nvidia_riva_model_supports_streaming(stt_model):
             print(f"STREAMING_STT_SKIPPED model={stt_model!r} offline_only=True", flush=True)
             return None
+        streaming_model = nvidia_riva_streaming_model(stt_model)
         from core.secrets import get_key
 
         key = get_key("nvidia")
@@ -605,13 +608,16 @@ class WhisperApp:
             key,
             base_url=settings.get("stt", {}).get("nvidia_nim_url", ""),
             language=mode.language or config.WHISPER_LANGUAGE,
-            model=stt_model,
+            model=streaming_model,
             text_callback=lambda text: self.signals.set_transcribed_text.emit(text),
         )
         try:
             session.start()
             self.recorder.add_audio_consumer(session)
-            print("STREAMING_STT_STARTED provider='nvidia_nim_parakeet'", flush=True)
+            print(
+                f"STREAMING_STT_STARTED provider='nvidia_nim_parakeet' model={streaming_model!r} selected_model={stt_model!r}",
+                flush=True,
+            )
             return session
         except Exception as exc:
             print(f"STREAMING_STT_UNAVAILABLE {exc}", flush=True)
@@ -663,6 +669,7 @@ class WhisperApp:
             }
             if not models:
                 models.add(_stt_model_name("nvidia_nim_parakeet"))
+            models.add(NVIDIA_RIVA_STREAMING_MODEL)
             warmed = prewarm_nvidia_riva(
                 key,
                 base_url=settings.get("stt", {}).get("nvidia_nim_url", ""),
@@ -1135,7 +1142,7 @@ class WhisperApp:
                     )
                     if streaming_session is not None:
                         streaming_provider = stt_provider
-                        streaming_model = stt_model
+                        streaming_model = getattr(streaming_session, "model", stt_model)
                     self.recorder.start()
                     context_prefetch = self._begin_context_prefetch(mode, settings, active_app)
                 if self._is_alt_pressed():
@@ -1263,7 +1270,7 @@ class WhisperApp:
             contexts.update(prefetched_contexts)
             streaming_text = ""
             if streaming_session is not None:
-                if stt_provider == streaming_provider and stt_model == streaming_model:
+                if stt_provider == streaming_provider:
                     wait_ms = int(perf_cfg.get("streaming_finalize_wait_ms", 450))
                     streaming_text = self._finish_streaming_stt(streaming_session, wait_s=max(0.05, wait_ms / 1000.0))
                     audio_duration_s = len(audio) / float(config.AUDIO_SAMPLE_RATE)

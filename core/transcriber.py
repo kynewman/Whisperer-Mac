@@ -37,6 +37,7 @@ DEFAULT_OPENAI_STT_MODEL = "gpt-4o-transcribe"
 DEFAULT_GROQ_STT_MODEL = "whisper-large-v3-turbo"
 DEFAULT_DEEPGRAM_STT_MODEL = "nova-3"
 DEFAULT_NVIDIA_NIM_STT_MODEL = "parakeet-tdt-0.6b-v2"
+NVIDIA_RIVA_STREAMING_MODEL = "parakeet-1.1b-rnnt-multilingual-asr"
 NVIDIA_HOSTED_RIVA_URI = "grpc.nvcf.nvidia.com:443"
 NVIDIA_NIM_LOCAL_HTTP_URL = "http://localhost:9000/v1/audio/transcriptions"
 NVIDIA_RIVA_FUNCTION_IDS = {
@@ -538,8 +539,16 @@ def _nvidia_model_id(model: str | None) -> str:
 
 
 def nvidia_riva_model_supports_streaming(model: str | None) -> bool:
-    """Hosted Parakeet TDT 0.6B is offline-only; RNNT is the streaming path."""
-    return "rnnt" in _nvidia_model_id(model).lower()
+    """NVIDIA hosted Parakeet streams through the RNNT Riva endpoint."""
+    return _nvidia_model_id(model) in NVIDIA_RIVA_FUNCTION_IDS
+
+
+def nvidia_riva_streaming_model(model: str | None) -> str:
+    """Return the hosted Riva model to use for low-latency Parakeet streaming."""
+    model_id = _nvidia_model_id(model)
+    if "rnnt" in model_id.lower():
+        return model_id
+    return NVIDIA_RIVA_STREAMING_MODEL
 
 
 def _nvidia_hosted_uri(base_url: str | None) -> str:

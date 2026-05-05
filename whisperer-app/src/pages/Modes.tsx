@@ -254,7 +254,7 @@ export default function ModesPage({
           />
           <Row
             title="STT model"
-            subtitle={working.stt === "nvidia_nim_parakeet" ? "RNNT is the streaming-capable Parakeet option." : "Optional provider-specific model name."}
+            subtitle={working.stt === "nvidia_nim_parakeet" ? "Live streaming uses Parakeet RNNT; final dictation can use any selected Parakeet model." : "Optional provider-specific model name."}
             control={
               working.stt === "nvidia_nim_parakeet" ? (
                 <Select
