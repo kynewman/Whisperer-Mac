@@ -6,7 +6,7 @@ All tuneable settings live here so you never have to dig through other files.
 import os
 import sys
 
-VERSION = "6.0.0"
+VERSION = "6.0.1"
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = os.name == "nt"
 

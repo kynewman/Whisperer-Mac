@@ -201,8 +201,8 @@ app = BUNDLE(
     bundle_identifier="com.whisperer.app",
     info_plist={
         "CFBundleDisplayName": "Whisperer",
-        "CFBundleShortVersionString": "6.0.0",
-        "CFBundleVersion": "6.0.0",
+        "CFBundleShortVersionString": "6.0.1",
+        "CFBundleVersion": "6.0.1",
         "CFBundleIconFile": "whisperer.icns",
         "NSMicrophoneUsageDescription": "Whisperer records microphone audio for local dictation.",
         "NSAppleEventsUsageDescription": "Whisperer uses Apple Events to paste dictation and read active-window context.",
