@@ -780,15 +780,18 @@ class NvidiaStreamingTranscriber:
     def adaptive_finalize_timeout(self, max_wait_s: float, fast_wait_s: float = 0.12) -> float:
         state = self.text_state()
         text = str(state.get("text") or "")
-        if not text:
-            return min(max_wait_s, 0.35)
-        if int(state.get("final_count") or 0) > 0:
-            return min(max_wait_s, 0.06)
         last_text_at = float(state.get("last_text_at") or 0.0)
         stable_for = time.perf_counter() - last_text_at if last_text_at else 0.0
-        if len(text) >= 4 and stable_for >= 0.10:
-            return min(max_wait_s, max(0.05, fast_wait_s))
-        return min(max_wait_s, 0.20)
+        if not text:
+            return min(max_wait_s, 0.40)
+        safe_fast_wait = max(0.20, fast_wait_s)
+        if stable_for < 0.12:
+            return min(max_wait_s, max(0.24, safe_fast_wait))
+        if int(state.get("final_count") or 0) > 0:
+            return min(max_wait_s, safe_fast_wait)
+        if len(text) >= 4 and stable_for >= 0.22:
+            return min(max_wait_s, safe_fast_wait)
+        return min(max_wait_s, 0.32)
 
     def _audio_chunks(self):
         while not self._stop_event.is_set() or not self._queue.empty():

@@ -52,7 +52,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "streaming_stt_enabled": True,
         "streaming_adaptive_finalize_enabled": True,
         "streaming_finalize_wait_ms": 450,
-        "streaming_fast_finalize_wait_ms": 120,
+        "streaming_fast_finalize_wait_ms": 220,
+        "streaming_tail_capture_ms": 90,
         "streaming_audio_chunk_ms": 32,
     },
     "audio": {

@@ -664,6 +664,17 @@ class WhisperApp:
         )
         return wait_s
 
+    def _capture_recording_tail(self, settings: dict) -> None:
+        try:
+            tail_ms = int(settings.get("performance", {}).get("streaming_tail_capture_ms", 90))
+        except (TypeError, ValueError):
+            tail_ms = 90
+        tail_ms = max(0, min(180, tail_ms))
+        if tail_ms <= 0:
+            return
+        with timed("recording_tail_capture"):
+            time.sleep(tail_ms / 1000.0)
+
     def _usable_streaming_text(self, text: str, audio_duration_s: float) -> bool:
         cleaned = (text or "").strip()
         if not cleaned:
@@ -1267,6 +1278,7 @@ class WhisperApp:
                 self.signals.hide_overlay.emit()
                 return
 
+            self._capture_recording_tail(settings)
             with timed("recorder_stop"):
                 audio = self.recorder.stop()
             print("MIC_LEVEL -96.0 0.0000", flush=True)
