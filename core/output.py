@@ -71,6 +71,7 @@ def paste_text(
     auto_send: bool = False,
     active_app: str = "",
     paste_delay_ms: int = 50,
+    fast_path: bool = False,
 ) -> bool:
     """
     Deliver text to the active window.
@@ -110,9 +111,10 @@ def paste_text(
                 _wait_for_modifier_release()
                 if not accessibility_access_granted():
                     print("PASTE_WARNING accessibility_not_trusted", flush=True)
+                min_settle_delay = 20 if fast_path else 75
                 delivered = paste_clipboard_to_application(
                     active_app,
-                    settle_delay_ms=max(75, paste_delay),
+                    settle_delay_ms=max(min_settle_delay, paste_delay),
                 )
                 if not delivered:
                     delivered = insert_text_into_focused_control(text, active_app)

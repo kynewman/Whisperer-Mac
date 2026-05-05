@@ -48,6 +48,22 @@ export type UpdateStatus = {
   assetUrl?: string;
   updateAvailable: boolean;
 };
+export type BenchmarkStatus = {
+  busy: boolean;
+  status?: string;
+  error?: string;
+  sampleSeconds?: number;
+  results?: Array<{
+    label: string;
+    provider?: string;
+    model?: string;
+    ok: boolean;
+    ms?: number;
+    chars?: number;
+    preview?: string;
+    error?: string;
+  }>;
+};
 export type VocabularySnapshot = {
   wordCount: number;
   words: Array<{ word: string; count: number; source?: string; last_seen?: string }>;
@@ -123,6 +139,7 @@ export interface AppSnapshot {
   shortcuts?: Record<string, string[]>;
   micLevel?: MicLevel;
   dictationBackup?: DictationBackup;
+  benchmarkStatus?: BenchmarkStatus;
   updateStatus?: UpdateStatus;
   apiKeys?: Record<string, boolean>;
   vocabulary?: VocabularySnapshot;
@@ -152,6 +169,7 @@ const DEFAULT_MICROPHONES: MicOption[] = [{ value: "default", label: "System def
 const DEFAULT_CHANNELS: BridgeOption[] = [{ value: "0", label: "Channel 1" }];
 const DEFAULT_MIC_LEVEL: MicLevel = { db: -96, level: 0 };
 const DEFAULT_DICTATION_BACKUP: DictationBackup = { available: false, busy: false };
+const DEFAULT_BENCHMARK_STATUS: BenchmarkStatus = { busy: false, results: [] };
 const DEFAULT_UPDATE_STATUS: UpdateStatus = {
   state: "idle",
   busy: false,
@@ -287,6 +305,7 @@ export default function App() {
   const [shortcuts, setShortcuts] = useState<Record<string, string[]>>({ dictation: ["Ctrl", "Cmd"] });
   const [micLevel, setMicLevel] = useState<MicLevel>(DEFAULT_MIC_LEVEL);
   const [dictationBackup, setDictationBackup] = useState<DictationBackup>(DEFAULT_DICTATION_BACKUP);
+  const [benchmarkStatus, setBenchmarkStatus] = useState<BenchmarkStatus>(DEFAULT_BENCHMARK_STATUS);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(DEFAULT_UPDATE_STATUS);
   const [apiKeys, setApiKeys] = useState<Record<string, boolean>>({});
   const [vocabulary, setVocabulary] = useState<VocabularySnapshot>(DEFAULT_VOCABULARY);
@@ -323,6 +342,7 @@ export default function App() {
     if (snapshot.shortcuts) setShortcuts(snapshot.shortcuts);
     if (snapshot.micLevel) setMicLevel(snapshot.micLevel);
     if (snapshot.dictationBackup) setDictationBackup(snapshot.dictationBackup);
+    if (snapshot.benchmarkStatus) setBenchmarkStatus(snapshot.benchmarkStatus);
     if (snapshot.updateStatus) setUpdateStatus(snapshot.updateStatus);
     if (snapshot.apiKeys) setApiKeys(snapshot.apiKeys);
     if (snapshot.vocabulary) setVocabulary(snapshot.vocabulary);
@@ -473,6 +493,10 @@ export default function App() {
     window.whisperer?.installUpdate?.().then(applySnapshot).catch(() => {});
   }, [applySnapshot]);
 
+  const runSttBenchmark = useCallback(() => {
+    window.whisperer?.runSttBenchmark?.().then(applySnapshot).catch(() => {});
+  }, [applySnapshot]);
+
   const pageTitle = NAV_ITEMS.find((n) => n.key === activePage)?.label || "";
   const densityScale = tweaks.density === "compact" ? 0.96 : 1;
   const dictationKeys = shortcuts.dictation?.length ? shortcuts.dictation : ["Ctrl", "Cmd"];
@@ -550,11 +574,13 @@ export default function App() {
                 settings={settings}
                 shortcuts={shortcuts}
                 apiKeys={apiKeys}
+                benchmarkStatus={benchmarkStatus}
                 updateStatus={updateStatus}
                 setSetting={setSetting}
                 setShortcut={setShortcut}
                 setApiKey={setApiKey}
                 deleteApiKey={deleteApiKey}
+                runSttBenchmark={runSttBenchmark}
                 checkForUpdates={checkForUpdates}
                 installUpdate={installUpdate}
               />

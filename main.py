@@ -498,20 +498,26 @@ class WhisperApp:
             return "", ""
         return self._capture_active_target()
 
-    def _needs_prompt_context(self, mode, context_mode: str) -> bool:
+    def _needs_prompt_context(self, mode, context_mode: str, stt_provider: str | None = None) -> bool:
         if context_mode == "off":
             return False
+        provider = (stt_provider or getattr(mode, "stt_provider", None) or "local").strip() or "local"
+        if getattr(mode, "llm_enabled", False):
+            return True
+        if provider in {"nvidia_nim_parakeet", "deepgram"}:
+            return False
         parakeet_local = (
-            (mode.stt_provider or "local") == "local"
+            provider == "local"
             and config.WHISPER_MODEL_SIZE.lower().startswith("nvidia/parakeet")
         )
-        return not (parakeet_local and not mode.llm_enabled)
+        return not parakeet_local
 
     def _begin_context_prefetch(
         self,
         mode,
         settings: dict,
         active_app: str,
+        stt_provider: str | None = None,
     ) -> dict:
         perf_cfg = settings.get("performance", {})
         context_mode = str(perf_cfg.get("context_mode", "fast")).lower()
@@ -522,7 +528,7 @@ class WhisperApp:
             "vocab_thread": None,
             "vocab": "",
         }
-        if not self._needs_prompt_context(mode, context_mode):
+        if not self._needs_prompt_context(mode, context_mode, stt_provider=stt_provider):
             return prefetch
 
         results = prefetch["results"]
@@ -635,6 +641,28 @@ class WhisperApp:
         if text:
             print(f"STREAMING_STT_READY chars={len(text)}", flush=True)
         return text
+
+    def _streaming_finalize_timeout(self, session, perf_cfg: dict, audio_duration_s: float) -> float:
+        try:
+            max_ms = int(perf_cfg.get("streaming_finalize_wait_ms", 450))
+        except (TypeError, ValueError):
+            max_ms = 450
+        max_wait_s = max(0.05, max_ms / 1000.0)
+        if not bool(perf_cfg.get("streaming_adaptive_finalize_enabled", True)):
+            return max_wait_s
+        try:
+            fast_ms = int(perf_cfg.get("streaming_fast_finalize_wait_ms", 120))
+        except (TypeError, ValueError):
+            fast_ms = 120
+        adaptive = getattr(session, "adaptive_finalize_timeout", None)
+        if not callable(adaptive):
+            return max_wait_s
+        wait_s = max(0.03, float(adaptive(max_wait_s, max(0.03, fast_ms / 1000.0))))
+        print(
+            f"STREAMING_STT_FINALIZE_WAIT wait={wait_s * 1000:.0f}ms max={max_wait_s * 1000:.0f}ms duration={audio_duration_s:.2f}s",
+            flush=True,
+        )
+        return wait_s
 
     def _usable_streaming_text(self, text: str, audio_duration_s: float) -> bool:
         cleaned = (text or "").strip()
@@ -961,7 +989,7 @@ class WhisperApp:
         if self._session_lock.locked() or self.recorder.is_recording:
             self._request_longform_lock()
 
-    def _resolve_paste_method(self, active_app: str, mode) -> tuple[str, bool, bool, int]:
+    def _resolve_paste_method(self, active_app: str, mode) -> tuple[str, bool, bool, int, bool]:
         """
         Determine paste method, restore_clipboard, and auto_send for the current app.
         Priority: per-app override > mode setting > global setting.
@@ -974,6 +1002,7 @@ class WhisperApp:
         restore = paste_cfg.get("restore_clipboard", False)
         auto_send = mode.auto_send if mode.auto_send else paste_cfg.get("auto_send_enter", False)
         paste_delay = int(perf_cfg.get("paste_delay_ms", 30))
+        fast_path = bool(perf_cfg.get("paste_fast_path_enabled", True))
 
         # Per-app overrides
         overrides = paste_cfg.get("per_app_overrides", {})
@@ -986,6 +1015,8 @@ class WhisperApp:
                     restore = override["restore_clipboard"]
                 if "auto_send_enter" in override:
                     auto_send = override["auto_send_enter"]
+                if "fast_path" in override:
+                    fast_path = bool(override["fast_path"])
                 break
 
         delay_overrides = perf_cfg.get("paste_delay_overrides", {})
@@ -997,7 +1028,20 @@ class WhisperApp:
                     pass
                 break
 
-        return method, restore, auto_send, paste_delay
+        if fast_path:
+            fast_apps = perf_cfg.get("paste_fast_apps", [])
+            if not isinstance(fast_apps, list):
+                fast_apps = []
+            fast_path = any(str(app).strip().lower() in active_lower for app in fast_apps if str(app).strip())
+            if method != "clipboard_paste" or restore:
+                fast_path = False
+            if fast_path:
+                try:
+                    paste_delay = min(paste_delay, max(0, int(perf_cfg.get("paste_fast_delay_ms", 12))))
+                except (TypeError, ValueError):
+                    paste_delay = min(paste_delay, 12)
+
+        return method, restore, auto_send, paste_delay, fast_path
 
     def _save_dictation_background(
         self,
@@ -1144,7 +1188,12 @@ class WhisperApp:
                         streaming_provider = stt_provider
                         streaming_model = getattr(streaming_session, "model", stt_model)
                     self.recorder.start()
-                    context_prefetch = self._begin_context_prefetch(mode, settings, active_app)
+                    context_prefetch = self._begin_context_prefetch(
+                        mode,
+                        settings,
+                        active_app,
+                        stt_provider=stt_provider,
+                    )
                 if self._is_alt_pressed():
                     self._request_longform_lock()
             except Exception as exc:
@@ -1265,15 +1314,18 @@ class WhisperApp:
             self.signals.set_status.emit("Transcribing...")
             context_budget = 0.35 if context_mode == "full" else 0.015
             if context_prefetch is None:
-                context_prefetch = self._begin_context_prefetch(mode, settings, active_app)
-            prefetched_contexts, vocab_hints = self._finish_context_prefetch(context_prefetch, wait_s=context_budget)
-            contexts.update(prefetched_contexts)
+                context_prefetch = self._begin_context_prefetch(
+                    mode,
+                    settings,
+                    active_app,
+                    stt_provider=stt_provider,
+                )
             streaming_text = ""
+            audio_duration_s = len(audio) / float(config.AUDIO_SAMPLE_RATE)
             if streaming_session is not None:
                 if stt_provider == streaming_provider:
-                    wait_ms = int(perf_cfg.get("streaming_finalize_wait_ms", 450))
-                    streaming_text = self._finish_streaming_stt(streaming_session, wait_s=max(0.05, wait_ms / 1000.0))
-                    audio_duration_s = len(audio) / float(config.AUDIO_SAMPLE_RATE)
+                    wait_s = self._streaming_finalize_timeout(streaming_session, perf_cfg, audio_duration_s)
+                    streaming_text = self._finish_streaming_stt(streaming_session, wait_s=wait_s)
                     if streaming_text and not self._usable_streaming_text(streaming_text, audio_duration_s):
                         print(
                             f"STREAMING_STT_DISCARDED chars={len(streaming_text.strip())} duration={audio_duration_s:.2f}s",
@@ -1283,6 +1335,9 @@ class WhisperApp:
                 else:
                     self._finish_streaming_stt(streaming_session, wait_s=0.05)
                 streaming_session = None
+            context_wait_s = 0.0 if streaming_text and not mode.llm_enabled else context_budget
+            prefetched_contexts, vocab_hints = self._finish_context_prefetch(context_prefetch, wait_s=context_wait_s)
+            contexts.update(prefetched_contexts)
 
             # Build context prompt for cloud/local
             prompt_parts: list[str] = []
@@ -1438,7 +1493,7 @@ class WhisperApp:
                 threading.Thread(target=add_words_from_list, args=(list(new_words),), kwargs={"source": "transcription"}, daemon=True).start()
 
             # Determine paste method
-            paste_method, restore_clipboard, auto_send, paste_delay = self._resolve_paste_method(active_app, mode)
+            paste_method, restore_clipboard, auto_send, paste_delay, paste_fast_path = self._resolve_paste_method(active_app, mode)
             paste_succeeded = 0
             try:
                 with timed("paste_delivery"):
@@ -1453,6 +1508,7 @@ class WhisperApp:
                         auto_send=auto_send,
                         active_app=active_app,
                         paste_delay_ms=paste_delay,
+                        fast_path=paste_fast_path,
                     ) else 0
                 if not paste_succeeded:
                     raise RuntimeError("Paste command was not delivered.")
@@ -1606,6 +1662,7 @@ class WhisperApp:
         restore = paste_cfg.get("restore_clipboard", False)
         auto_send = paste_cfg.get("auto_send_enter", False)
         paste_delay = int(perf_cfg.get("paste_delay_ms", 30))
+        fast_path = bool(perf_cfg.get("paste_fast_path_enabled", True))
         # Check per-app override
         overrides = paste_cfg.get("per_app_overrides", {})
         active_lower = active_app.lower()
@@ -1617,6 +1674,8 @@ class WhisperApp:
                     restore = override["restore_clipboard"]
                 if "auto_send_enter" in override:
                     auto_send = override["auto_send_enter"]
+                if "fast_path" in override:
+                    fast_path = bool(override["fast_path"])
                 break
         for app_substring, delay in perf_cfg.get("paste_delay_overrides", {}).items():
             if app_substring.lower() in active_lower:
@@ -1625,6 +1684,18 @@ class WhisperApp:
                 except (TypeError, ValueError):
                     pass
                 break
+        if fast_path:
+            fast_apps = perf_cfg.get("paste_fast_apps", [])
+            if not isinstance(fast_apps, list):
+                fast_apps = []
+            fast_path = any(str(app).strip().lower() in active_lower for app in fast_apps if str(app).strip())
+            if method != "clipboard_paste" or restore:
+                fast_path = False
+            if fast_path:
+                try:
+                    paste_delay = min(paste_delay, max(0, int(perf_cfg.get("paste_fast_delay_ms", 12))))
+                except (TypeError, ValueError):
+                    paste_delay = min(paste_delay, 12)
         try:
             paste_text(
                 self._last_dictation_text,
@@ -1633,6 +1704,7 @@ class WhisperApp:
                 auto_send=auto_send,
                 active_app=active_app,
                 paste_delay_ms=paste_delay,
+                fast_path=fast_path,
             )
         except Exception:
             pass
@@ -1755,6 +1827,12 @@ class WhisperApp:
                             target=lambda: self._transcribe_last_dictation_command(request_id),
                             daemon=True,
                         ).start()
+                    elif payload.get("command") == "benchmark_stt":
+                        request_id = str(payload.get("requestId") or "")
+                        threading.Thread(
+                            target=lambda: self._benchmark_stt_command(request_id),
+                            daemon=True,
+                        ).start()
                     elif payload.get("command") == "set_hotkeys_paused":
                         self._set_hotkeys_paused(bool(payload.get("paused")))
             except Exception:
@@ -1770,6 +1848,165 @@ class WhisperApp:
             "error": error or "",
         }
         print("BACKUP_TRANSCRIPTION_RESULT " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+    def _emit_stt_benchmark_result(
+        self,
+        request_id: str,
+        ok: bool,
+        results: list[dict] | None = None,
+        error: str = "",
+        sample_seconds: float = 0.0,
+    ):
+        payload = {
+            "requestId": request_id,
+            "ok": bool(ok),
+            "results": results or [],
+            "error": error or "",
+            "sampleSeconds": round(float(sample_seconds or 0.0), 2),
+        }
+        print("STT_BENCHMARK_RESULT " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+    def _benchmark_audio_sample(self, audio: np.ndarray) -> np.ndarray:
+        audio = np.asarray(audio, dtype=np.float32).flatten()
+        max_samples = int(config.AUDIO_SAMPLE_RATE * 4)
+        min_samples = int(config.AUDIO_SAMPLE_RATE * 0.5)
+        if len(audio) > max_samples:
+            audio = audio[:max_samples]
+        if len(audio) < min_samples:
+            return np.zeros(0, dtype=np.float32)
+        return audio.astype(np.float32, copy=False)
+
+    def _benchmark_stt_command(self, request_id: str):
+        try:
+            from core.dictation_backup import finalize_last_dictation_wav, load_last_dictation_audio
+            from core.secrets import get_key
+            from core.transcriber import (
+                DEFAULT_DEEPGRAM_STT_MODEL,
+                DEFAULT_GROQ_STT_MODEL,
+                DEFAULT_NVIDIA_NIM_STT_MODEL,
+                DEFAULT_OPENAI_STT_MODEL,
+                NVIDIA_RIVA_STREAMING_MODEL,
+                trim_silence,
+                transcribe_cloud,
+            )
+
+            finalize_last_dictation_wav()
+            audio = self._benchmark_audio_sample(trim_silence(load_last_dictation_audio()))
+            sample_seconds = len(audio) / float(config.AUDIO_SAMPLE_RATE) if len(audio) else 0.0
+            if len(audio) == 0:
+                self._emit_stt_benchmark_result(
+                    request_id,
+                    False,
+                    error="Record one normal dictation first so the benchmark has a shared audio sample.",
+                )
+                return
+
+            settings = load_settings()
+            language = config.WHISPER_LANGUAGE
+            results: list[dict] = []
+
+            def run_case(label: str, provider: str, key_name: str, model: str, base_url: str = ""):
+                try:
+                    api_key = get_key(key_name)
+                except Exception:
+                    api_key = None
+                if not api_key and provider not in {"nvidia_nim_parakeet", "openai_compatible_stt"}:
+                    return
+                started = time.perf_counter()
+                try:
+                    text = transcribe_cloud(
+                        audio,
+                        provider,
+                        api_key,
+                        language=language,
+                        model=model,
+                        base_url=base_url,
+                    )
+                    results.append(
+                        {
+                            "label": label,
+                            "provider": provider,
+                            "model": model,
+                            "ok": True,
+                            "ms": round((time.perf_counter() - started) * 1000.0, 1),
+                            "chars": len((text or "").strip()),
+                            "preview": (text or "").strip()[:120],
+                        }
+                    )
+                except Exception as exc:
+                    results.append(
+                        {
+                            "label": label,
+                            "provider": provider,
+                            "model": model,
+                            "ok": False,
+                            "ms": round((time.perf_counter() - started) * 1000.0, 1),
+                            "error": str(exc)[:180],
+                        }
+                    )
+
+            try:
+                nvidia_key = get_key("nvidia")
+            except Exception:
+                nvidia_key = None
+            nvidia_base_url = settings.get("stt", {}).get("nvidia_nim_url", "")
+            if nvidia_key:
+                started = time.perf_counter()
+                try:
+                    session = NvidiaStreamingTranscriber(
+                        nvidia_key,
+                        base_url=nvidia_base_url,
+                        language=language,
+                        model=NVIDIA_RIVA_STREAMING_MODEL,
+                    )
+                    session.start()
+                    chunk_samples = max(160, int(config.AUDIO_SAMPLE_RATE * 0.032))
+                    for start in range(0, len(audio), chunk_samples):
+                        session.feed_audio(audio[start : start + chunk_samples])
+                    text = session.finish(timeout_s=0.9)
+                    error = session.error
+                    if error:
+                        raise RuntimeError(error)
+                    results.append(
+                        {
+                            "label": "NVIDIA Parakeet RNNT streaming",
+                            "provider": "nvidia_nim_parakeet",
+                            "model": NVIDIA_RIVA_STREAMING_MODEL,
+                            "ok": True,
+                            "ms": round((time.perf_counter() - started) * 1000.0, 1),
+                            "chars": len((text or "").strip()),
+                            "preview": (text or "").strip()[:120],
+                        }
+                    )
+                except Exception as exc:
+                    results.append(
+                        {
+                            "label": "NVIDIA Parakeet RNNT streaming",
+                            "provider": "nvidia_nim_parakeet",
+                            "model": NVIDIA_RIVA_STREAMING_MODEL,
+                            "ok": False,
+                            "ms": round((time.perf_counter() - started) * 1000.0, 1),
+                            "error": str(exc)[:180],
+                        }
+                    )
+                run_case("NVIDIA Parakeet TDT 0.6B final", "nvidia_nim_parakeet", "nvidia", DEFAULT_NVIDIA_NIM_STT_MODEL, nvidia_base_url)
+                run_case("NVIDIA Parakeet CTC 0.6B final", "nvidia_nim_parakeet", "nvidia", "parakeet-ctc-0.6b-asr", nvidia_base_url)
+            run_case("Groq Whisper v3 Turbo", "groq_whisper", "groq", DEFAULT_GROQ_STT_MODEL)
+            run_case("OpenAI speech", "openai_whisper", "openai", DEFAULT_OPENAI_STT_MODEL)
+            run_case("Deepgram Nova", "deepgram", "deepgram", DEFAULT_DEEPGRAM_STT_MODEL)
+
+            if not results:
+                self._emit_stt_benchmark_result(
+                    request_id,
+                    False,
+                    error="No benchmarkable cloud STT API keys are saved.",
+                    sample_seconds=sample_seconds,
+                )
+                return
+            results.sort(key=lambda item: (not bool(item.get("ok")), float(item.get("ms") or 999999)))
+            self._emit_stt_benchmark_result(request_id, True, results=results, sample_seconds=sample_seconds)
+        except Exception as exc:
+            self._emit_stt_benchmark_result(request_id, False, error=str(exc))
 
     def _transcribe_last_dictation_command(self, request_id: str):
         if not self._model_ready.wait(timeout=180):

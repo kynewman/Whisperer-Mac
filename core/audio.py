@@ -53,6 +53,9 @@ class AudioRecorder:
         self._input_channel = 0
         self._channels = config.AUDIO_CHANNELS
         self._warm_stream = True
+        self._streaming_chunk_ms = 32
+        self._consumer_chunk_samples = max(1, int(config.AUDIO_SAMPLE_RATE * self._streaming_chunk_ms / 1000))
+        self._stream_blocksize = config.AUDIO_BLOCKSIZE
         self._auto_input_channel = True
         self._input_device_name = ""
         self._max_input_channels = config.AUDIO_CHANNELS
@@ -174,9 +177,20 @@ class AudioRecorder:
             try:
                 feed_audio = getattr(consumer, "feed_audio", None)
                 if callable(feed_audio):
-                    feed_audio(flat)
+                    for chunk in self._consumer_chunks(flat):
+                        feed_audio(chunk)
             except Exception:
                 pass
+
+    def _consumer_chunks(self, samples: np.ndarray):
+        max_samples = max(1, int(self._consumer_chunk_samples))
+        if len(samples) <= max_samples:
+            yield samples
+            return
+        for start in range(0, len(samples), max_samples):
+            chunk = samples[start : start + max_samples]
+            if len(chunk):
+                yield chunk
 
     def _start_backup_cache(self):
         raw_path = reset_last_dictation_backup()
@@ -226,10 +240,18 @@ class AudioRecorder:
             self._channels,
             self._stream_samplerate,
             self._warm_stream,
+            self._streaming_chunk_ms,
+            self._stream_blocksize,
             self._auto_input_channel,
             self._max_input_channels,
         )
         self._warm_stream = bool(settings.get("performance", {}).get("warm_microphone_stream", True))
+        try:
+            chunk_ms = int(settings.get("performance", {}).get("streaming_audio_chunk_ms", 32))
+        except (TypeError, ValueError):
+            chunk_ms = 32
+        self._streaming_chunk_ms = max(10, min(80, chunk_ms))
+        self._consumer_chunk_samples = max(160, int(config.AUDIO_SAMPLE_RATE * self._streaming_chunk_ms / 1000))
         audio_settings = settings.get("audio", {})
         device_index = audio_settings.get("input_device")
         device_name = audio_settings.get("input_device_name")
@@ -274,6 +296,8 @@ class AudioRecorder:
 
         self._device_index = selected_index
         self._stream_samplerate = int(round(device_info.get("default_samplerate") or config.AUDIO_SAMPLE_RATE))
+        requested_blocksize = max(128, int(round(self._stream_samplerate * self._streaming_chunk_ms / 1000)))
+        self._stream_blocksize = min(config.AUDIO_BLOCKSIZE, requested_blocksize)
         max_channels = max(1, int(device_info.get("max_input_channels", config.AUDIO_CHANNELS)))
         self._max_input_channels = max_channels
         self._input_channel = min(requested_channel, max_channels - 1)
@@ -291,6 +315,8 @@ class AudioRecorder:
             self._channels,
             self._stream_samplerate,
             self._warm_stream,
+            self._streaming_chunk_ms,
+            self._stream_blocksize,
             self._auto_input_channel,
             self._max_input_channels,
         )
@@ -370,7 +396,7 @@ class AudioRecorder:
             samplerate=self._stream_samplerate,
             channels=self._channels,
             dtype=config.AUDIO_DTYPE,
-            blocksize=config.AUDIO_BLOCKSIZE,
+            blocksize=self._stream_blocksize,
             device=self._device_index,
             callback=self._callback,
         )

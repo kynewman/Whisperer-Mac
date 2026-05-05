@@ -716,12 +716,21 @@ class NvidiaStreamingTranscriber:
         self._best_text = ""
         self._error = ""
         self._started_at = 0.0
+        self._last_text_at = 0.0
+        self._final_count = 0
 
     def start(self) -> bool:
         if self._thread is not None:
             return True
         self._stop_event.clear()
         self._started_at = time.perf_counter()
+        with self._lock:
+            self._final_parts.clear()
+            self._partial_text = ""
+            self._best_text = ""
+            self._error = ""
+            self._last_text_at = 0.0
+            self._final_count = 0
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return True
@@ -758,6 +767,29 @@ class NvidiaStreamingTranscriber:
         with self._lock:
             return self._error
 
+    def text_state(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "text": self._best_text.strip(),
+                "partial": self._partial_text.strip(),
+                "final_count": self._final_count,
+                "last_text_at": self._last_text_at,
+                "error": self._error,
+            }
+
+    def adaptive_finalize_timeout(self, max_wait_s: float, fast_wait_s: float = 0.12) -> float:
+        state = self.text_state()
+        text = str(state.get("text") or "")
+        if not text:
+            return min(max_wait_s, 0.35)
+        if int(state.get("final_count") or 0) > 0:
+            return min(max_wait_s, 0.06)
+        last_text_at = float(state.get("last_text_at") or 0.0)
+        stable_for = time.perf_counter() - last_text_at if last_text_at else 0.0
+        if len(text) >= 4 and stable_for >= 0.10:
+            return min(max_wait_s, max(0.05, fast_wait_s))
+        return min(max_wait_s, 0.20)
+
     def _audio_chunks(self):
         while not self._stop_event.is_set() or not self._queue.empty():
             try:
@@ -791,9 +823,11 @@ class NvidiaStreamingTranscriber:
                         if bool(getattr(result, "is_final", False)):
                             self._final_parts.append(text)
                             self._partial_text = ""
+                            self._final_count += 1
                         else:
                             self._partial_text = text
                         self._best_text = " ".join([*self._final_parts, self._partial_text]).strip()
+                        self._last_text_at = time.perf_counter()
                         current = self._best_text
                     if current and self.text_callback:
                         self.text_callback(current)

@@ -345,6 +345,10 @@ class Bridge(QObject):
     def transcribeLastDictation(self) -> str:
         return self._window.transcribe_last_dictation()
 
+    @pyqtSlot(result=str)
+    def runSttBenchmark(self) -> str:
+        return self._window.run_stt_benchmark()
+
     @pyqtSlot(int, result=str)
     def deleteDictation(self, dictation_id: int) -> str:
         return self._window.delete_dictation(dictation_id)
@@ -450,6 +454,7 @@ _BRIDGE_SHIM = r"""
         addReplacementRule: function(matchText, replaceWith) { return callResult("addReplacementRule", matchText, replaceWith); },
         copyText: function(text) { return callResult("copyText", text); },
         transcribeLastDictation: function() { return callResult("transcribeLastDictation"); },
+        runSttBenchmark: function() { return callResult("runSttBenchmark"); },
         deleteDictation: function(dictationId) { return callResult("deleteDictation", dictationId); },
         purgeHistory: function() { return callResult("purgeHistory"); },
         addMode: function(name) { return callResult("addMode", name || "New Mode"); },
@@ -511,6 +516,7 @@ class MainWindow(QMainWindow):
 
     loadingPreviewRequested = pyqtSignal()
     backupTranscriptionFinished = pyqtSignal(str, bool, str, str)
+    sttBenchmarkFinished = pyqtSignal(str, bool, str, str)
     updateStatusChanged = pyqtSignal(str)
 
     def __init__(self):
@@ -550,6 +556,12 @@ class MainWindow(QMainWindow):
         self._backup_transcription_error = ""
         self._backup_transcription_request_id = ""
         self._backup_transcription_source = ""
+        self._benchmark_busy = False
+        self._benchmark_status = ""
+        self._benchmark_error = ""
+        self._benchmark_results: list[dict[str, Any]] = []
+        self._benchmark_sample_seconds = 0.0
+        self._benchmark_request_id = ""
         self._update_status = self._default_update_status()
         self._update_install_script = ""
         self._microphone_cache: list[dict[str, str]] = []
@@ -574,8 +586,12 @@ class MainWindow(QMainWindow):
         self._backup_transcription_timeout_timer = QTimer(self)
         self._backup_transcription_timeout_timer.setSingleShot(True)
         self._backup_transcription_timeout_timer.timeout.connect(self._on_backup_transcription_timeout)
+        self._benchmark_timeout_timer = QTimer(self)
+        self._benchmark_timeout_timer.setSingleShot(True)
+        self._benchmark_timeout_timer.timeout.connect(self._on_stt_benchmark_timeout)
         self.loadingPreviewRequested.connect(self._show_loading_preview)
         self.backupTranscriptionFinished.connect(self._finish_last_dictation_transcription)
+        self.sttBenchmarkFinished.connect(self._finish_stt_benchmark)
         self.updateStatusChanged.connect(self._apply_update_status)
         if self._loading_preview_enabled and not self._shortcut_capture_active:
             self._register_loading_preview_shortcuts()
@@ -887,6 +903,7 @@ class MainWindow(QMainWindow):
             "shortcuts": self._shortcut_payload(),
             "micLevel": self._mic_level_payload(),
             "dictationBackup": self._dictation_backup_payload(),
+            "benchmarkStatus": self._benchmark_payload(),
             "apiKeys": self._api_key_payload(),
             "updateStatus": self._update_status_payload(),
         }
@@ -1177,6 +1194,50 @@ echo "$(date) update installed" >> "$LOG"
         payload["error"] = self._backup_transcription_error
         return payload
 
+    def _benchmark_payload(self) -> dict[str, Any]:
+        return {
+            "busy": bool(self._benchmark_busy),
+            "status": self._benchmark_status,
+            "error": self._benchmark_error,
+            "results": self._benchmark_results,
+            "sampleSeconds": round(float(self._benchmark_sample_seconds or 0.0), 2),
+        }
+
+    def run_stt_benchmark(self) -> str:
+        if self._benchmark_busy:
+            return self.snapshot_json()
+        payload = self._dictation_backup_payload()
+        if not payload.get("available"):
+            self._benchmark_status = ""
+            self._benchmark_error = "Record one dictation first so there is a shared audio sample."
+            self._benchmark_results = []
+            self._benchmark_sample_seconds = 0.0
+            snapshot = self.snapshot_json()
+            self.bridge.settingsChanged.emit(snapshot)
+            return snapshot
+        if not self.process or self.process.poll() is not None or self._engine_state != "running":
+            self._benchmark_status = ""
+            self._benchmark_error = "Start the engine before running the STT benchmark."
+            self._benchmark_results = []
+            self._benchmark_sample_seconds = 0.0
+            snapshot = self.snapshot_json()
+            self.bridge.settingsChanged.emit(snapshot)
+            return snapshot
+
+        self._benchmark_busy = True
+        self._benchmark_status = "Benchmarking saved STT providers..."
+        self._benchmark_error = ""
+        self._benchmark_results = []
+        self._benchmark_sample_seconds = 0.0
+        request_id = str(int(time.time() * 1000))
+        self._benchmark_request_id = request_id
+        snapshot = self.snapshot_json()
+        self.bridge.settingsChanged.emit(snapshot)
+        self._benchmark_timeout_timer.start(240000)
+        if not self._send_engine_command({"command": "benchmark_stt", "requestId": request_id}, require_running=True):
+            self._finish_stt_benchmark(request_id, False, "", "Could not send the benchmark request to the engine.")
+        return snapshot
+
     def transcribe_last_dictation(self) -> str:
         if self._backup_transcription_busy:
             return self.snapshot_json()
@@ -1273,6 +1334,51 @@ echo "$(date) update installed" >> "$LOG"
             False,
             "",
             "Last dictation transcription took too long and was stopped. Try again after the engine is ready.",
+        )
+
+    def _finish_stt_benchmark(self, request_id: str, ok: bool, result_json: str, error: str):
+        if request_id and request_id != self._benchmark_request_id:
+            return
+        self._benchmark_timeout_timer.stop()
+        self._benchmark_busy = False
+        self._benchmark_request_id = ""
+        if ok:
+            try:
+                payload = json.loads(result_json or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            results = payload.get("results") if isinstance(payload, dict) else []
+            if not isinstance(results, list):
+                results = []
+            self._benchmark_results = results
+            try:
+                self._benchmark_sample_seconds = float(payload.get("sampleSeconds") or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                self._benchmark_sample_seconds = 0.0
+            if results:
+                fastest = next((item for item in results if item.get("ok")), results[0])
+                label = str(fastest.get("label") or "fastest provider")
+                ms = fastest.get("ms")
+                self._benchmark_status = f"Fastest result: {label} in {ms}ms."
+                self._benchmark_error = ""
+            else:
+                self._benchmark_status = ""
+                self._benchmark_error = "The benchmark completed without any provider results."
+        else:
+            self._benchmark_results = []
+            self._benchmark_sample_seconds = 0.0
+            self._benchmark_status = ""
+            self._benchmark_error = error or "Could not run the STT benchmark."
+        self._emit_snapshot()
+
+    def _on_stt_benchmark_timeout(self):
+        if not self._benchmark_busy:
+            return
+        self._finish_stt_benchmark(
+            self._benchmark_request_id,
+            False,
+            "",
+            "The STT benchmark took too long and was stopped.",
         )
 
     def _engine_python_context(self) -> tuple[str, str, dict[str, str]]:
@@ -2650,6 +2756,9 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
             if line.startswith("BACKUP_TRANSCRIPTION_RESULT "):
                 self._handle_backup_transcription_engine_result(line)
                 continue
+            if line.startswith("STT_BENCHMARK_RESULT "):
+                self._handle_stt_benchmark_engine_result(line)
+                continue
             if line == "OPEN_UI_REQUESTED":
                 self._log_web_ui("Engine requested UI window")
                 self.show_window()
@@ -2690,6 +2799,13 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                     "",
                     "The engine stopped before the last dictation could be transcribed.",
                 )
+            if self._benchmark_busy:
+                self._finish_stt_benchmark(
+                    self._benchmark_request_id,
+                    False,
+                    "",
+                    "The engine stopped before the STT benchmark finished.",
+                )
             if (
                 return_code == ENGINE_FORCE_STOP_RESTART_CODE
                 and not self._paused
@@ -2719,6 +2835,29 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
         text = str(payload.get("text") or "")
         error = str(payload.get("error") or "")
         self.backupTranscriptionFinished.emit(request_id, ok, text, error)
+
+    def _handle_stt_benchmark_engine_result(self, line: str):
+        try:
+            payload = json.loads(line.split(" ", 1)[1])
+        except Exception as exc:
+            self.sttBenchmarkFinished.emit(
+                self._benchmark_request_id,
+                False,
+                "",
+                f"Could not read benchmark response: {exc}",
+            )
+            return
+        request_id = str(payload.get("requestId") or "")
+        ok = bool(payload.get("ok"))
+        error = str(payload.get("error") or "")
+        result_json = json.dumps(
+            {
+                "results": payload.get("results") or [],
+                "sampleSeconds": payload.get("sampleSeconds") or 0,
+            },
+            separators=(",", ":"),
+        )
+        self.sttBenchmarkFinished.emit(request_id, ok, result_json, error)
 
     def closeEvent(self, event):
         if not self._force_quitting and self.tray and self.tray.isVisible():

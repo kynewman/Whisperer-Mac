@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Btn, Card, Eyebrow, Icon, Input, KeyCombo, Row, SectionTitle, Select, Toggle } from "../primitives";
 import { SHORTCUTS } from "../data";
-import type { AppSettings, Tweaks, UpdateStatus } from "../App";
+import type { AppSettings, BenchmarkStatus, Tweaks, UpdateStatus } from "../App";
 
 type ProviderKey = {
   service: string;
@@ -170,11 +170,13 @@ export default function ConfigPage({
   settings: appSettings,
   shortcuts,
   apiKeys,
+  benchmarkStatus,
   updateStatus,
   setSetting,
   setShortcut,
   setApiKey,
   deleteApiKey,
+  runSttBenchmark,
   checkForUpdates,
   installUpdate,
 }: {
@@ -183,11 +185,13 @@ export default function ConfigPage({
   settings: AppSettings;
   shortcuts: Record<string, string[]>;
   apiKeys: Record<string, boolean>;
+  benchmarkStatus: BenchmarkStatus;
   updateStatus: UpdateStatus;
   setSetting: (section: string, key: string, value: unknown) => void;
   setShortcut: (name: string, value: string) => void;
   setApiKey: (service: string, value: string) => void;
   deleteApiKey: (service: string) => void;
+  runSttBenchmark: () => void;
   checkForUpdates: () => void;
   installUpdate: () => void;
 }) {
@@ -197,6 +201,8 @@ export default function ConfigPage({
     retainAudio: Boolean(appSettings.privacy?.store_audio_history ?? false),
     retainHistory: Boolean(appSettings.privacy?.retain_history ?? true),
     enginePreload: String(appSettings.performance?.engine_preload ?? "app_start"),
+    adaptiveStreaming: Boolean(appSettings.performance?.streaming_adaptive_finalize_enabled ?? true),
+    fastPaste: Boolean(appSettings.performance?.paste_fast_path_enabled ?? true),
     autoSendEnter: Boolean(appSettings.paste?.auto_send_enter ?? false),
     restoreClipboard: Boolean(appSettings.paste?.restore_clipboard ?? false),
     pasteMethod: String(appSettings.paste?.method ?? "clipboard_paste"),
@@ -224,6 +230,8 @@ export default function ConfigPage({
       retainAudio: Boolean(appSettings.privacy?.store_audio_history ?? false),
       retainHistory: Boolean(appSettings.privacy?.retain_history ?? true),
       enginePreload: String(appSettings.performance?.engine_preload ?? "app_start"),
+      adaptiveStreaming: Boolean(appSettings.performance?.streaming_adaptive_finalize_enabled ?? true),
+      fastPaste: Boolean(appSettings.performance?.paste_fast_path_enabled ?? true),
       autoSendEnter: Boolean(appSettings.paste?.auto_send_enter ?? false),
       restoreClipboard: Boolean(appSettings.paste?.restore_clipboard ?? false),
       pasteMethod: String(appSettings.paste?.method ?? "clipboard_paste"),
@@ -244,6 +252,8 @@ export default function ConfigPage({
     if (k === "retainHistory") setSetting("privacy", "retain_history", v);
     if (k === "retainAudio") setSetting("privacy", "store_audio_history", v);
     if (k === "enginePreload") setSetting("performance", "engine_preload", v);
+    if (k === "adaptiveStreaming") setSetting("performance", "streaming_adaptive_finalize_enabled", v);
+    if (k === "fastPaste") setSetting("performance", "paste_fast_path_enabled", v);
     if (k === "ollamaUrl") setSetting("llm", "ollama_url", v);
     if (k === "openaiCompatUrl") setSetting("llm", "openai_compat_url", v);
     if (k === "sttCompatUrl") setSetting("stt", "openai_compat_url", v);
@@ -569,6 +579,37 @@ export default function ConfigPage({
              control={<Toggle checked={settings.restoreClipboard} onChange={(v) => set("restoreClipboard", v)} />} />
         <Row title="Auto-send Enter after paste" subtitle="Submit chat messages automatically. Avoid in code editors."
              control={<Toggle checked={settings.autoSendEnter} onChange={(v) => set("autoSendEnter", v)} />} divider={false} />
+      </Card>
+
+      <SectionTitle>Performance</SectionTitle>
+      <Card style={{ marginBottom: 18 }}>
+        <Row title="Adaptive streaming finalization" subtitle="Use the shortest safe RNNT close wait when streaming already has usable text."
+             control={<Toggle checked={settings.adaptiveStreaming} onChange={(v) => set("adaptiveStreaming", v)} />} />
+        <Row title="Known-good paste fast path" subtitle="Use a lower paste settle delay in apps that reliably accept immediate clipboard paste."
+             control={<Toggle checked={settings.fastPaste} onChange={(v) => set("fastPaste", v)} />} />
+        <Row
+          title="STT provider benchmark"
+          subtitle={benchmarkStatus.busy ? "Benchmarking the last dictation sample." : benchmarkStatus.status || benchmarkStatus.error || "Compare saved cloud STT providers on the same last dictation sample."}
+          control={<Btn size="sm" variant="secondary" icon="play" disabled={benchmarkStatus.busy} onClick={runSttBenchmark}>{benchmarkStatus.busy ? "Running" : "Run"}</Btn>}
+          divider={Boolean(benchmarkStatus.results?.length)}
+        />
+        {Boolean(benchmarkStatus.results?.length) && (
+          <div style={{ padding: "8px 0 2px", display: "grid", gap: 8 }}>
+            {benchmarkStatus.results?.slice(0, 5).map((result, index) => (
+              <div key={`${result.label}-${index}`} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 12, alignItems: "center", padding: "8px 0", borderTop: index === 0 ? "none" : "1px solid var(--line-soft)" }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 12.5, color: result.ok ? "var(--ink)" : "var(--ink-3)", fontWeight: 600 }}>{result.label}</div>
+                  <div style={{ fontSize: 11.5, color: result.ok ? "var(--ink-3)" : "var(--rec)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {result.ok ? `${result.chars || 0} chars${benchmarkStatus.sampleSeconds ? ` from ${benchmarkStatus.sampleSeconds}s` : ""}` : result.error || "Failed"}
+                  </div>
+                </div>
+                <span className="mono" style={{ color: result.ok ? "var(--accent-ink)" : "var(--ink-3)", fontSize: 12, fontWeight: 600 }}>
+                  {result.ok ? `${Math.round(Number(result.ms) || 0)}ms` : "-"}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
 
       <SectionTitle>Privacy</SectionTitle>
