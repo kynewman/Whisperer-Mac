@@ -630,6 +630,21 @@ class WhisperApp:
             print(f"STREAMING_STT_READY chars={len(text)}", flush=True)
         return text
 
+    def _usable_streaming_text(self, text: str, audio_duration_s: float) -> bool:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return False
+        # A one-character final is usually an abandoned partial from hosted
+        # streaming. Fall back to the normal provider request instead of
+        # pasting junk over a perfectly good dictation.
+        if len(cleaned) < 2:
+            return False
+        if not any(ch.isalnum() for ch in cleaned):
+            return False
+        if audio_duration_s >= 1.5 and len(cleaned) < 4 and " " not in cleaned:
+            return False
+        return True
+
     def _prewarm_cloud_stt_clients(self, settings: dict) -> None:
         """Hide cloud SDK imports/client setup behind startup idle time."""
         try:
@@ -1251,6 +1266,13 @@ class WhisperApp:
                 if stt_provider == streaming_provider and stt_model == streaming_model:
                     wait_ms = int(perf_cfg.get("streaming_finalize_wait_ms", 450))
                     streaming_text = self._finish_streaming_stt(streaming_session, wait_s=max(0.05, wait_ms / 1000.0))
+                    audio_duration_s = len(audio) / float(config.AUDIO_SAMPLE_RATE)
+                    if streaming_text and not self._usable_streaming_text(streaming_text, audio_duration_s):
+                        print(
+                            f"STREAMING_STT_DISCARDED chars={len(streaming_text.strip())} duration={audio_duration_s:.2f}s",
+                            flush=True,
+                        )
+                        streaming_text = ""
                 else:
                     self._finish_streaming_stt(streaming_session, wait_s=0.05)
                 streaming_session = None

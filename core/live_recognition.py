@@ -25,8 +25,9 @@ class LiveRecognizer:
     
     def __init__(self, text_callback=None):
         self.text_callback = text_callback
-        self.queue = queue.Queue()
+        self.queue = queue.Queue(maxsize=64)
         self._stop_event = threading.Event()
+        self._accepting_audio = False
         self._thread = None
         self.model = None
         self.recognizer = None
@@ -76,7 +77,7 @@ class LiveRecognizer:
     def start(self):
         """Start processing audio for live recognition."""
         if not self.model or not self.recognizer:
-            print("Cannot start live recognition: model not loaded yet.")
+            self._accepting_audio = False
             return
             
         self.finalized_text = ""
@@ -89,6 +90,7 @@ class LiveRecognizer:
                 break
                 
         self._stop_event.clear()
+        self._accepting_audio = True
         self.recognizer.Reset()
         
         if self.text_callback:
@@ -99,6 +101,7 @@ class LiveRecognizer:
         
     def stop(self):
         """Stop processing audio."""
+        self._accepting_audio = False
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=1.0)
@@ -106,8 +109,19 @@ class LiveRecognizer:
             
     def feed_audio(self, float_array: np.ndarray):
         """Receive audio chunk from AudioRecorder."""
-        if not self._stop_event.is_set():
-            self.queue.put(float_array.copy())
+        if not self._accepting_audio or self._stop_event.is_set():
+            return
+        try:
+            self.queue.put_nowait(float_array.copy())
+        except queue.Full:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(float_array.copy())
+            except queue.Full:
+                pass
             
     def _process_loop(self):
         """Continuously pulls from the queue and transcribes via Vosk."""

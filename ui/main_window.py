@@ -2165,6 +2165,24 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "ctxClipboard": "ctx_clipboard",
             }
             updates = {target: patch[source] for source, target in mapping.items() if source in patch}
+            if "stt_provider" in updates:
+                provider = str(updates.get("stt_provider") or "local")
+                requested_model = str(updates.get("stt_model") or "").strip()
+                if provider == "nvidia_nim_parakeet":
+                    valid = {item["value"] for item in NVIDIA_NIM_MODEL_OPTIONS}
+                    normalized = _nvidia_nim_model_value(requested_model)
+                    updates["stt_model"] = normalized if normalized in valid else NVIDIA_NIM_DEFAULT_MODEL
+                elif provider == "groq_whisper":
+                    valid = {item["value"] for item in self._groq_stt_fallback_options()}
+                    updates["stt_model"] = requested_model if requested_model in valid else "whisper-large-v3-turbo"
+                elif provider == "local":
+                    updates["stt_model"] = ""
+                elif not requested_model:
+                    updates["stt_model"] = ""
+            elif updates.get("stt_model"):
+                normalized = _nvidia_nim_model_value(str(updates["stt_model"]))
+                if normalized != updates["stt_model"]:
+                    updates["stt_model"] = normalized
             if updates:
                 update_mode(int(mode_id), **updates)
         except Exception:

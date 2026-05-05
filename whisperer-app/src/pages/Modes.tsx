@@ -2,6 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { Btn, Card, Eyebrow, Input, Pill, Row, SectionTitle, Select, Toggle } from "../primitives";
 import type { AppSnapshot, ModeItem } from "../App";
 
+const NVIDIA_PARAKEET_MODELS = [
+  { value: "parakeet-tdt-0.6b-v2", label: "NVIDIA Parakeet TDT 0.6B v2" },
+  { value: "parakeet-ctc-0.6b-asr", label: "NVIDIA Parakeet CTC 0.6B" },
+  { value: "parakeet-1.1b-rnnt-multilingual-asr", label: "NVIDIA Parakeet RNNT 1.1B" },
+];
+
+const GROQ_STT_MODELS = [
+  { value: "whisper-large-v3-turbo", label: "Whisper Large v3 Turbo" },
+  { value: "whisper-large-v3", label: "Whisper Large v3" },
+];
+
 function parseSnapshot(raw: string | AppSnapshot | undefined): AppSnapshot | null {
   if (!raw) return null;
   if (typeof raw !== "string") return raw;
@@ -50,7 +61,16 @@ export default function ModesPage({
   const working = draft || mode;
 
   const edit = (patch: Partial<ModeItem>) => {
-    setDraft((current) => current ? { ...current, ...patch } : current);
+    setDraft((current) => {
+      if (!current) return current;
+      const next = { ...current, ...patch };
+      if (patch.stt && patch.stt !== current.stt) {
+        if (patch.stt === "nvidia_nim_parakeet") next.sttModel = "parakeet-tdt-0.6b-v2";
+        else if (patch.stt === "groq_whisper") next.sttModel = "whisper-large-v3-turbo";
+        else next.sttModel = "";
+      }
+      return next;
+    });
     setDirty(true);
   };
 
@@ -232,8 +252,29 @@ export default function ModesPage({
             subtitle="The model family used before formatting."
             control={<Select value={working.stt} onChange={(v) => edit({ stt: v })} options={[{ value: "local", label: "Local" }, { value: "groq_whisper", label: "Groq Fast Cloud" }, { value: "openai_whisper", label: "OpenAI Speech" }, { value: "deepgram", label: "Deepgram Nova" }, { value: "nvidia_nim_parakeet", label: "NVIDIA Parakeet API" }, { value: "openai_compatible_stt", label: "OpenAI-compatible STT" }]} width={240} />}
           />
-          <Row title="STT model override" subtitle="Optional provider-specific model name."
-               control={<Input value={working.sttModel || ""} onChange={(v) => edit({ sttModel: v } as Partial<ModeItem>)} placeholder="provider default" style={{ width: 260 }} />} />
+          <Row
+            title="STT model"
+            subtitle={working.stt === "nvidia_nim_parakeet" ? "RNNT is the streaming-capable Parakeet option." : "Optional provider-specific model name."}
+            control={
+              working.stt === "nvidia_nim_parakeet" ? (
+                <Select
+                  value={working.sttModel || "parakeet-tdt-0.6b-v2"}
+                  onChange={(v) => edit({ sttModel: v } as Partial<ModeItem>)}
+                  options={NVIDIA_PARAKEET_MODELS}
+                  width={260}
+                />
+              ) : working.stt === "groq_whisper" ? (
+                <Select
+                  value={working.sttModel || "whisper-large-v3-turbo"}
+                  onChange={(v) => edit({ sttModel: v } as Partial<ModeItem>)}
+                  options={GROQ_STT_MODELS}
+                  width={260}
+                />
+              ) : (
+                <Input value={working.sttModel || ""} onChange={(v) => edit({ sttModel: v } as Partial<ModeItem>)} placeholder="provider default" style={{ width: 260 }} />
+              )
+            }
+          />
           <Row
             title="LLM post-processing"
             subtitle={working.llm ? "An LLM rewrites the raw transcript using the mode prompt." : "Off - paste the raw transcript after replacements."}
