@@ -13,6 +13,68 @@ import ctypes.util
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = os.name == "nt"
 
+_MAC_KEY_CODES = {
+    "a": 0,
+    "s": 1,
+    "d": 2,
+    "f": 3,
+    "h": 4,
+    "g": 5,
+    "z": 6,
+    "x": 7,
+    "c": 8,
+    "v": 9,
+    "b": 11,
+    "q": 12,
+    "w": 13,
+    "e": 14,
+    "r": 15,
+    "y": 16,
+    "t": 17,
+    "1": 18,
+    "2": 19,
+    "3": 20,
+    "4": 21,
+    "6": 22,
+    "5": 23,
+    "equals": 24,
+    "9": 25,
+    "7": 26,
+    "minus": 27,
+    "8": 28,
+    "0": 29,
+    "right bracket": 30,
+    "o": 31,
+    "u": 32,
+    "left bracket": 33,
+    "i": 34,
+    "p": 35,
+    "enter": 36,
+    "return": 36,
+    "l": 37,
+    "j": 38,
+    "quote": 39,
+    "k": 40,
+    "semicolon": 41,
+    "backslash": 42,
+    "comma": 43,
+    "slash": 44,
+    "n": 45,
+    "m": 46,
+    "period": 47,
+    "tab": 48,
+    "space": 49,
+    "grave": 50,
+    "delete": 51,
+    "backspace": 51,
+    "escape": 53,
+    "esc": 53,
+    "left": 123,
+    "right": 124,
+    "down": 125,
+    "up": 126,
+}
+
 
 def app_support_dir(app_name: str = "Whisperer") -> str:
     """Return a per-user application support directory."""
@@ -67,8 +129,68 @@ def _run_osascript(script: str, timeout: float = 1.0) -> str:
     return (result.stdout or "").strip()
 
 
+def accessibility_access_granted() -> bool:
+    """Return whether this process is trusted for Accessibility event posting."""
+    if not IS_MAC:
+        return True
+    try:
+        services_path = (
+            ctypes.util.find_library("ApplicationServices")
+            or "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        services = ctypes.CDLL(services_path)
+        trusted = services.AXIsProcessTrusted
+        trusted.argtypes = []
+        trusted.restype = ctypes.c_bool
+        return bool(trusted())
+    except Exception:
+        return False
+
+
+def _appkit_frontmost_application_name() -> str:
+    if not IS_MAC:
+        return ""
+    try:
+        from AppKit import NSWorkspace
+
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if app is None:
+            return ""
+        return str(app.localizedName() or app.bundleIdentifier() or "").strip()
+    except Exception:
+        return ""
+
+
+def _activate_application_appkit(process_name: str) -> bool:
+    if not IS_MAC:
+        return False
+    target = (process_name or "").strip().lower()
+    if not target:
+        return False
+    try:
+        import AppKit
+
+        workspace = AppKit.NSWorkspace.sharedWorkspace()
+        options = getattr(AppKit, "NSApplicationActivateIgnoringOtherApps", 2)
+        for app in workspace.runningApplications():
+            localized = str(app.localizedName() or "").strip()
+            bundle_id = str(app.bundleIdentifier() or "").strip()
+            candidates = {localized.lower(), bundle_id.lower()}
+            if target not in candidates:
+                continue
+            if bool(app.activateWithOptions_(options)):
+                time.sleep(0.06)
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def active_window_name() -> str:
     if IS_MAC:
+        appkit_name = _appkit_frontmost_application_name()
+        if appkit_name:
+            return appkit_name
         return _run_osascript(
             """
             tell application "System Events"
@@ -158,6 +280,8 @@ def activate_application_process(process_name: str) -> bool:
     name = (process_name or "").strip()
     if not name:
         return False
+    if _activate_application_appkit(name):
+        return True
     escaped = name.replace("\\", "\\\\").replace('"', '\\"')
     result = _run_osascript(
         f"""
@@ -176,9 +300,77 @@ def activate_application_process(process_name: str) -> bool:
         timeout=1.5,
     )
     if result == "ok":
-        time.sleep(0.03)
+        time.sleep(0.06)
         return True
     return False
+
+
+def _shortcut_parts(shortcut: str) -> tuple[list[str], str]:
+    parts = [part.strip().lower() for part in shortcut.split("+") if part.strip()]
+    if not parts:
+        return [], ""
+    lookup = {
+        "control": "ctrl",
+        "command": "cmd",
+        "meta": "cmd",
+        "option": "alt",
+        "return": "enter",
+        "esc": "escape",
+        "=": "equals",
+        "-": "minus",
+        "[": "left bracket",
+        "]": "right bracket",
+        "'": "quote",
+        ";": "semicolon",
+        "\\": "backslash",
+        ",": "comma",
+        "/": "slash",
+        "`": "grave",
+        ".": "period",
+    }
+    normalized = [lookup.get(part, part) for part in parts]
+    return normalized[:-1], normalized[-1]
+
+
+def _send_shortcut_quartz(shortcut: str) -> bool:
+    """Post a shortcut through Quartz so paste does not depend on System Events automation."""
+    if not IS_MAC:
+        return False
+    modifiers, key = _shortcut_parts(shortcut)
+    key_code = _MAC_KEY_CODES.get(key)
+    if key_code is None:
+        return False
+    if not accessibility_access_granted():
+        return False
+    try:
+        import Quartz
+
+        flags = 0
+        if any(part in {"cmd", "command", "meta"} for part in modifiers):
+            flags |= Quartz.kCGEventFlagMaskCommand
+        if any(part in {"ctrl", "control"} for part in modifiers):
+            flags |= Quartz.kCGEventFlagMaskControl
+        if any(part in {"alt", "option"} for part in modifiers):
+            flags |= Quartz.kCGEventFlagMaskAlternate
+        if "shift" in modifiers:
+            flags |= Quartz.kCGEventFlagMaskShift
+        if "fn" in modifiers and hasattr(Quartz, "kCGEventFlagMaskSecondaryFn"):
+            flags |= Quartz.kCGEventFlagMaskSecondaryFn
+
+        source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+        down = Quartz.CGEventCreateKeyboardEvent(source, key_code, True)
+        up = Quartz.CGEventCreateKeyboardEvent(source, key_code, False)
+        if down is None or up is None:
+            return False
+        Quartz.CGEventSetFlags(down, flags)
+        Quartz.CGEventSetFlags(up, flags)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        time.sleep(0.018)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        time.sleep(0.035)
+        return True
+    except Exception:
+        return False
 
 
 def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int = 80) -> bool:
@@ -190,11 +382,13 @@ def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int 
         current = active_window_name()
         if current.lower() != target.lower() and not activate_application_process(target):
             return False
-        deadline = time.time() + 0.8
+        deadline = time.time() + 1.2
         while time.time() < deadline:
             if active_window_name().lower() == target.lower():
                 break
             time.sleep(0.03)
+        if active_window_name().lower() != target.lower():
+            return False
     time.sleep(max(0, int(settle_delay_ms)) / 1000.0)
     return send_shortcut("cmd+v")
 
@@ -257,25 +451,14 @@ def send_shortcut(shortcut: str) -> bool:
     """Send a keyboard shortcut to the active app."""
     if not IS_MAC:
         return False
-    parts = [part.strip().lower() for part in shortcut.split("+") if part.strip()]
+    if _send_shortcut_quartz(shortcut):
+        return True
+    modifiers_list, key = _shortcut_parts(shortcut)
+    parts = [*modifiers_list, key] if key else []
     if not parts:
         return False
-    key = parts[-1]
     modifiers = _modifier_clause(parts[:-1])
-    keycodes = {
-        "enter": 36,
-        "return": 36,
-        "escape": 53,
-        "esc": 53,
-        "tab": 48,
-        "space": 49,
-        "left": 123,
-        "right": 124,
-        "down": 125,
-        "up": 126,
-        "delete": 51,
-        "backspace": 51,
-    }
+    keycodes = {key_name: code for key_name, code in _MAC_KEY_CODES.items() if code >= 36 or key_name in {"space"}}
     if key in keycodes:
         script = f"""
         tell application "System Events"
@@ -307,8 +490,13 @@ def type_text(text: str) -> bool:
     # Fallback for environments where pynput is unavailable. This is slower,
     # but keeps simulate-keys mode functional for plain text.
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-    script = f'tell application "System Events" to keystroke "{escaped}"'
-    return bool(_run_osascript(script, timeout=max(1.0, min(10.0, len(text) / 20.0))) or True)
+    script = f"""
+    tell application "System Events"
+      keystroke "{escaped}"
+      return "ok"
+    end tell
+    """
+    return _run_osascript(script, timeout=max(1.0, min(10.0, len(text) / 20.0))) == "ok"
 
 
 def copy_selection_to_clipboard() -> None:

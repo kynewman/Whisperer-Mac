@@ -78,6 +78,25 @@ def _check_keyring() -> dict:
         return {"name": "Keyring", "ok": False, "message": str(exc)}
 
 
+def _check_macos_accessibility() -> dict:
+    if sys.platform != "darwin":
+        return {"name": "macOS Accessibility", "ok": True, "message": "Not required on this platform"}
+    try:
+        from core import native
+
+        trusted = native.accessibility_access_granted()
+        active = native.active_window_name() or "unknown"
+        if trusted:
+            return {"name": "macOS Accessibility", "ok": True, "message": f"Trusted; front app: {active}"}
+        return {
+            "name": "macOS Accessibility",
+            "ok": False,
+            "message": f"Not trusted; paste hotkeys may be blocked. Front app: {active}",
+        }
+    except Exception as exc:
+        return {"name": "macOS Accessibility", "ok": False, "message": str(exc)}
+
+
 def _check_file_transcription() -> dict:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -104,6 +123,7 @@ def run_diagnostics() -> list[dict]:
         _check_ocr(),
         _check_ffmpeg(),
         _check_keyring(),
+        _check_macos_accessibility(),
         _check_file_transcription(),
     ]
 

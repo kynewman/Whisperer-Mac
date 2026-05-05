@@ -38,9 +38,30 @@ def _copy_to_clipboard(text: str) -> bool:
         return False
     try:
         pyperclip.copy(text)
+        deadline = time.time() + 0.35
+        while time.time() < deadline:
+            try:
+                if pyperclip.paste() == text:
+                    return True
+            except Exception:
+                return True
+            time.sleep(0.015)
         return True
     except Exception:
         return False
+
+
+def _wait_for_modifier_release(timeout_s: float = 0.45) -> None:
+    if sys.platform != "darwin" or not _HOTKEYS_AVAILABLE or hotkeys is None:
+        return
+    deadline = time.time() + max(0.0, timeout_s)
+    while time.time() < deadline:
+        try:
+            if not hotkeys.pressed_modifiers():
+                return
+        except Exception:
+            return
+        time.sleep(0.015)
 
 
 def paste_text(
@@ -80,14 +101,21 @@ def paste_text(
         delivered = False
         if sys.platform == "darwin":
             try:
-                from core.native import insert_text_into_focused_control, paste_clipboard_to_application
+                from core.native import (
+                    accessibility_access_granted,
+                    insert_text_into_focused_control,
+                    paste_clipboard_to_application,
+                )
 
-                delivered = insert_text_into_focused_control(text, active_app)
+                _wait_for_modifier_release()
+                if not accessibility_access_granted():
+                    print("PASTE_WARNING accessibility_not_trusted", flush=True)
+                delivered = paste_clipboard_to_application(
+                    active_app,
+                    settle_delay_ms=max(140, paste_delay),
+                )
                 if not delivered:
-                    delivered = paste_clipboard_to_application(
-                        active_app,
-                        settle_delay_ms=max(90, paste_delay),
-                    )
+                    delivered = insert_text_into_focused_control(text, active_app)
             except Exception:
                 delivered = False
         else:

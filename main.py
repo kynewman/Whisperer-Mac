@@ -239,6 +239,9 @@ class WhisperApp:
         self._pre_ready_hotkey_lock = threading.Lock()
         self._suppress_pre_ready_hotkey_until_release = False
         self._pre_ready_longform_requested = threading.Event()
+        self._pending_active_target_lock = threading.Lock()
+        self._pending_active_app = ""
+        self._pending_window_title = ""
         self._audio_ducker: AudioDucker | None = None
         self._audio_ducker_lock = threading.Lock()
         self._audio_ducking_ticket = 0
@@ -306,6 +309,7 @@ class WhisperApp:
         with self._pre_ready_hotkey_lock:
             self._suppress_pre_ready_hotkey_until_release = False
         self._pre_ready_longform_requested.clear()
+        self._clear_pending_active_target()
 
     def _pre_ready_hotkey_still_held(self) -> bool:
         with self._pre_ready_hotkey_lock:
@@ -319,6 +323,7 @@ class WhisperApp:
         with self._pre_ready_hotkey_lock:
             self._suppress_pre_ready_hotkey_until_release = False
         self._pre_ready_longform_requested.clear()
+        self._clear_pending_active_target()
         return False
 
     def _clear_pre_ready_hotkey_suppression(self):
@@ -339,6 +344,9 @@ class WhisperApp:
             return False
         self._clear_pre_ready_hotkey_suppression()
         self._clear_longform_lock()
+        active_app, window_title = self._consume_pending_active_target()
+        if not active_app and not window_title:
+            active_app, window_title = self._capture_active_target()
         self._prime_listening_overlay()
         if longform_requested:
             self._request_longform_lock()
@@ -346,6 +354,8 @@ class WhisperApp:
             target=lambda: self._run_one_dictation_session(
                 lock_acquired=True,
                 overlay_primed=True,
+                initial_active_app=active_app,
+                initial_window_title=window_title,
             ),
             daemon=True,
         ).start()
@@ -423,6 +433,29 @@ class WhisperApp:
             return get_active_window_name(), get_active_window_title()
         except Exception:
             return "", ""
+
+    def _store_pending_active_target(self, active_app: str = "", window_title: str = "") -> tuple[str, str]:
+        if not active_app and not window_title:
+            active_app, window_title = self._capture_active_target()
+        with self._pending_active_target_lock:
+            self._pending_active_app = active_app or ""
+            self._pending_window_title = window_title or ""
+        if active_app or window_title:
+            print(f"DICTATION_TARGET_CAPTURED app={active_app!r} title={window_title!r}", flush=True)
+        return active_app, window_title
+
+    def _consume_pending_active_target(self) -> tuple[str, str]:
+        with self._pending_active_target_lock:
+            active_app = self._pending_active_app
+            window_title = self._pending_window_title
+            self._pending_active_app = ""
+            self._pending_window_title = ""
+        return active_app, window_title
+
+    def _clear_pending_active_target(self) -> None:
+        with self._pending_active_target_lock:
+            self._pending_active_app = ""
+            self._pending_window_title = ""
 
     def _begin_active_target_capture(self) -> tuple[dict[str, str], threading.Thread]:
         result = {"active_app": "", "window_title": ""}
@@ -680,9 +713,17 @@ class WhisperApp:
                 return
             self._clear_longform_lock()
             self._request_longform_lock()
+            active_app, window_title = self._consume_pending_active_target()
+            if not active_app and not window_title:
+                active_app, window_title = self._capture_active_target()
             self._prime_listening_overlay()
             threading.Thread(
-                target=lambda: self._run_one_dictation_session(lock_acquired=True, overlay_primed=True),
+                target=lambda: self._run_one_dictation_session(
+                    lock_acquired=True,
+                    overlay_primed=True,
+                    initial_active_app=active_app,
+                    initial_window_title=window_title,
+                ),
                 daemon=True,
             ).start()
             return
@@ -1225,6 +1266,7 @@ class WhisperApp:
     def _on_hotkey_pressed(self):
         """Called when user presses the dictation hotkey. Start dictation session in a background thread."""
         if not self._model_ready.is_set():
+            self._store_pending_active_target()
             self._mark_pre_ready_hotkey()
             self._show_model_loading_overlay()
             return
@@ -1233,6 +1275,9 @@ class WhisperApp:
         if not self._session_lock.acquire(blocking=False):
             return
         self._clear_longform_lock()
+        active_app, window_title = self._capture_active_target()
+        if active_app or window_title:
+            print(f"DICTATION_TARGET_CAPTURED app={active_app!r} title={window_title!r}", flush=True)
         self._prime_listening_overlay()
         if self._is_alt_pressed():
             self._request_longform_lock()
@@ -1240,6 +1285,8 @@ class WhisperApp:
             target=lambda: self._run_one_dictation_session(
                 lock_acquired=True,
                 overlay_primed=True,
+                initial_active_app=active_app,
+                initial_window_title=window_title,
             ),
             daemon=True,
         ).start()
@@ -1247,6 +1294,7 @@ class WhisperApp:
     def _on_toggle_pressed(self):
         """Called when user presses the toggle recording hotkey."""
         if not self._model_ready.is_set():
+            self._store_pending_active_target()
             self._mark_pre_ready_hotkey()
             self._show_model_loading_overlay()
             return
@@ -1259,6 +1307,9 @@ class WhisperApp:
         if not self._session_lock.acquire(blocking=False):
             return
         self._clear_longform_lock()
+        active_app, window_title = self._capture_active_target()
+        if active_app or window_title:
+            print(f"DICTATION_TARGET_CAPTURED app={active_app!r} title={window_title!r}", flush=True)
         self._prime_listening_overlay()
         if self._is_alt_pressed():
             self._request_longform_lock()
@@ -1267,6 +1318,8 @@ class WhisperApp:
                 toggle_mode=True,
                 lock_acquired=True,
                 overlay_primed=True,
+                initial_active_app=active_app,
+                initial_window_title=window_title,
             ),
             daemon=True,
         ).start()
