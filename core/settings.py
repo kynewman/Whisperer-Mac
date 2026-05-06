@@ -33,6 +33,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "paste_delay_ms": 30,
         "paste_delay_overrides": {},
         "paste_fast_path_enabled": True,
+        "paste_fast_all_apps": True,
         "paste_fast_delay_ms": 12,
         "paste_fast_apps": [
             "codex",

@@ -1058,10 +1058,12 @@ class WhisperApp:
                 break
 
         if fast_path:
-            fast_apps = perf_cfg.get("paste_fast_apps", [])
-            if not isinstance(fast_apps, list):
-                fast_apps = []
-            fast_path = any(str(app).strip().lower() in active_lower for app in fast_apps if str(app).strip())
+            fast_all_apps = bool(perf_cfg.get("paste_fast_all_apps", True))
+            if not fast_all_apps:
+                fast_apps = perf_cfg.get("paste_fast_apps", [])
+                if not isinstance(fast_apps, list):
+                    fast_apps = []
+                fast_path = any(str(app).strip().lower() in active_lower for app in fast_apps if str(app).strip())
             if method != "clipboard_paste" or restore:
                 fast_path = False
             if fast_path:
@@ -1530,19 +1532,22 @@ class WhisperApp:
                 preceding_text_known = sys.platform != "darwin"
                 if sys.platform == "darwin":
                     try:
-                        from core.native import focused_control_preceding_text, focused_control_snapshot
+                        from core.native import (
+                            accessibility_access_granted,
+                            focused_control_snapshot,
+                            preceding_text_from_snapshot,
+                        )
 
-                        focus_snapshot = focused_control_snapshot(active_app)
-                        focus_value = str(focus_snapshot.get("value", "")) if focus_snapshot else ""
-                        focus_range = str(focus_snapshot.get("selected_range", "")).strip() if focus_snapshot else ""
-                        cursor_at_start = focus_range in {"0:0", "0,0"}
-                        # Some apps expose a focused element but not its text. Treat that
-                        # as unknown unless Accessibility explicitly reports cursor 0.
-                        preceding_text_known = bool(focus_snapshot and (focus_value or cursor_at_start))
-                        if focus_snapshot:
-                            preceding_text = focused_control_preceding_text(active_app)
-                            if not preceding_text and not cursor_at_start:
-                                preceding_text_known = False
+                        if accessibility_access_granted():
+                            with timed("insertion_spacing_context"):
+                                focus_snapshot = focused_control_snapshot(active_app, timeout=0.22)
+                            preceding_text, preceding_text_known, cursor_at_start = preceding_text_from_snapshot(
+                                focus_snapshot
+                            )
+                            # Some apps expose a focused element but not its text. Treat that
+                            # as unknown unless Accessibility explicitly reports cursor 0.
+                            if cursor_at_start:
+                                preceding_text_known = True
                     except Exception:
                         preceding_text = ""
                         preceding_text_known = False
@@ -1761,10 +1766,12 @@ class WhisperApp:
                     pass
                 break
         if fast_path:
-            fast_apps = perf_cfg.get("paste_fast_apps", [])
-            if not isinstance(fast_apps, list):
-                fast_apps = []
-            fast_path = any(str(app).strip().lower() in active_lower for app in fast_apps if str(app).strip())
+            fast_all_apps = bool(perf_cfg.get("paste_fast_all_apps", True))
+            if not fast_all_apps:
+                fast_apps = perf_cfg.get("paste_fast_apps", [])
+                if not isinstance(fast_apps, list):
+                    fast_apps = []
+                fast_path = any(str(app).strip().lower() in active_lower for app in fast_apps if str(app).strip())
             if method != "clipboard_paste" or restore:
                 fast_path = False
             if fast_path:
@@ -2120,6 +2127,14 @@ class WhisperApp:
 
     def run(self):
         self._start_stdin_command_reader()
+        if sys.platform == "darwin":
+            try:
+                from core.native import request_accessibility_access
+
+                if not request_accessibility_access(prompt=True):
+                    print("ACCESSIBILITY_PERMISSION_MISSING paste_and_hotkeys_may_be_blocked", flush=True)
+            except Exception:
+                pass
         self._register_shortcuts()
         threading.Thread(target=self._load_engine_background, daemon=True).start()
         sys.exit(self.app.exec())

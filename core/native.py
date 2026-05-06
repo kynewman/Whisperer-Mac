@@ -153,6 +153,54 @@ def accessibility_access_granted() -> bool:
         return False
 
 
+def request_accessibility_access(prompt: bool = False) -> bool:
+    """Return Accessibility trust and optionally ask macOS to show the permission prompt."""
+    if not IS_MAC:
+        return True
+    try:
+        import Quartz
+
+        options = None
+        if prompt:
+            key = getattr(Quartz, "kAXTrustedCheckOptionPrompt", "AXTrustedCheckOptionPrompt")
+            options = {key: True}
+        trusted_with_options = getattr(Quartz, "AXIsProcessTrustedWithOptions", None)
+        if callable(trusted_with_options):
+            return bool(trusted_with_options(options or {}))
+    except Exception:
+        pass
+    return accessibility_access_granted()
+
+
+def set_clipboard_text(text: str) -> bool:
+    """Set macOS pasteboard text without spawning pbcopy."""
+    if not IS_MAC:
+        return False
+    try:
+        import AppKit
+
+        pasteboard = AppKit.NSPasteboard.generalPasteboard()
+        pasteboard_type = getattr(AppKit, "NSPasteboardTypeString", "public.utf8-plain-text")
+        pasteboard.clearContents()
+        return bool(pasteboard.setString_forType_(str(text), pasteboard_type))
+    except Exception:
+        return False
+
+
+def get_clipboard_text() -> str:
+    """Return macOS pasteboard text without spawning pbpaste."""
+    if not IS_MAC:
+        return ""
+    try:
+        import AppKit
+
+        pasteboard = AppKit.NSPasteboard.generalPasteboard()
+        pasteboard_type = getattr(AppKit, "NSPasteboardTypeString", "public.utf8-plain-text")
+        return str(pasteboard.stringForType_(pasteboard_type) or "")
+    except Exception:
+        return ""
+
+
 def _appkit_frontmost_application_name() -> str:
     if not IS_MAC:
         return ""
@@ -342,7 +390,7 @@ def focused_control_preceding_text(process_name: str = "", limit: int = 80) -> s
     return raw[-max(1, int(limit)) :]
 
 
-def focused_control_snapshot(process_name: str = "", value_limit: int = 2000) -> dict[str, str]:
+def focused_control_snapshot(process_name: str = "", value_limit: int = 2000, timeout: float = 0.8) -> dict[str, str]:
     """Return focused-control text and selection metadata when Accessibility exposes it."""
     if not IS_MAC:
         return {}
@@ -367,6 +415,7 @@ def focused_control_snapshot(process_name: str = "", value_limit: int = 2000) ->
               set maybeValue to value of focusedElement
               if maybeValue is not missing value then set fieldValue to maybeValue as string
             end try
+            set fieldValueLength to length of fieldValue
             set selectionText to ""
             try
               set maybeSelection to value of attribute "AXSelectedText" of focusedElement
@@ -381,25 +430,78 @@ def focused_control_snapshot(process_name: str = "", value_limit: int = 2000) ->
                 set rangeText to (location of selectedRange as string) & ":" & (length of selectedRange as string)
               end try
             end try
-            return fieldValue & "<<<WHISPERER_AX_SEP>>>" & selectionText & "<<<WHISPERER_AX_SEP>>>" & rangeText
+            set separatorText to "<<<WHISPERER_AX_SEP>>>"
+            return fieldValue & separatorText & selectionText & separatorText & rangeText & separatorText & (fieldValueLength as string)
           on error
             return ""
           end try
         end tell
         """,
-        timeout=0.8,
+        timeout=max(0.05, float(timeout)),
     )
     if not raw:
         return {}
-    parts = raw.split("<<<WHISPERER_AX_SEP>>>", 2)
+    parts = raw.split("<<<WHISPERER_AX_SEP>>>", 3)
     value = parts[0] if parts else ""
+    value_length = len(value)
+    if len(parts) > 3:
+        try:
+            value_length = max(0, int(parts[3]))
+        except (TypeError, ValueError):
+            value_length = len(value)
     if len(value) > value_limit:
         value = value[-value_limit:]
     return {
         "value": value,
         "selected_text": parts[1] if len(parts) > 1 else "",
         "selected_range": parts[2] if len(parts) > 2 else "",
+        "value_length": str(value_length),
     }
+
+
+def _parse_selected_range(value: str) -> tuple[int, int] | None:
+    cleaned = str(value or "").strip().replace(",", ":")
+    if not cleaned or ":" not in cleaned:
+        return None
+    left, right = cleaned.split(":", 1)
+    try:
+        location = max(0, int(float(left.strip())))
+        length = max(0, int(float(right.strip())))
+        return location, length
+    except (TypeError, ValueError):
+        return None
+
+
+def preceding_text_from_snapshot(snapshot: dict[str, str] | None, limit: int = 80) -> tuple[str, bool, bool]:
+    """Derive text before the insertion point from a focused-control snapshot.
+
+    Returns (preceding_text, known, cursor_at_start). A false "known" means the
+    control did not expose enough data quickly enough and callers should use
+    their fallback spacing behavior.
+    """
+    if not snapshot:
+        return "", False, False
+    selected_range = _parse_selected_range(str(snapshot.get("selected_range", "")))
+    if selected_range is None:
+        return "", False, False
+    cursor_index, selection_length = selected_range
+    cursor_at_start = cursor_index == 0 and selection_length == 0
+    if cursor_at_start:
+        return "", True, True
+    value = str(snapshot.get("value", "") or "")
+    try:
+        value_length = max(len(value), int(str(snapshot.get("value_length", len(value)))))
+    except (TypeError, ValueError):
+        value_length = len(value)
+    if not value:
+        return "", False, cursor_at_start
+    truncated_start = max(0, value_length - len(value))
+    if cursor_index < truncated_start:
+        return "", False, cursor_at_start
+    relative_cursor = max(0, min(len(value), cursor_index - truncated_start))
+    if relative_cursor <= 0:
+        return "", False, cursor_at_start
+    return value[max(0, relative_cursor - max(1, int(limit))) : relative_cursor], True, cursor_at_start
 
 
 def activate_application_process(process_name: str) -> bool:
@@ -520,7 +622,13 @@ def _snapshot_changed_after_insert(before: dict[str, str], after: dict[str, str]
     return False
 
 
-def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int = 80, expected_text: str = "") -> bool:
+def paste_clipboard_to_application(
+    process_name: str = "",
+    settle_delay_ms: int = 80,
+    expected_text: str = "",
+    verify: bool = False,
+    verify_timeout_ms: int = 220,
+) -> bool:
     """Activate the target macOS app and deliver the current clipboard with Cmd+V."""
     if not IS_MAC:
         return False
@@ -536,14 +644,14 @@ def paste_clipboard_to_application(process_name: str = "", settle_delay_ms: int 
             time.sleep(0.03)
         if active_window_name().lower() != target.lower():
             return False
-    before = focused_control_snapshot(target) if expected_text else {}
+    before = focused_control_snapshot(target, timeout=0.22) if verify and expected_text else {}
     time.sleep(max(0, int(settle_delay_ms)) / 1000.0)
     if not send_shortcut("cmd+v"):
         return False
-    if not expected_text:
+    if not verify or not expected_text:
         return True
-    time.sleep(0.08)
-    after = focused_control_snapshot(target)
+    time.sleep(max(0.08, min(0.45, int(verify_timeout_ms) / 1000.0)))
+    after = focused_control_snapshot(target, timeout=0.22)
     changed = _snapshot_changed_after_insert(before, after, expected_text)
     if changed is False:
         print("PASTE_VERIFY no_focused_text_change_after_shortcut", flush=True)

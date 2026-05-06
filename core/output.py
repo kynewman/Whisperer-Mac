@@ -33,7 +33,37 @@ def _restore_clipboard_later(old: str, delay: float = 0.8):
     threading.Timer(delay, _restore).start()
 
 
+def _native_clipboard_text() -> str:
+    if sys.platform != "darwin":
+        return ""
+    try:
+        from core.native import get_clipboard_text
+
+        return get_clipboard_text()
+    except Exception:
+        return ""
+
+
+def _set_native_clipboard_text(text: str) -> bool:
+    if sys.platform != "darwin":
+        return False
+    try:
+        from core.native import set_clipboard_text
+
+        return set_clipboard_text(text)
+    except Exception:
+        return False
+
+
 def _copy_to_clipboard(text: str) -> bool:
+    if _set_native_clipboard_text(text):
+        deadline = time.time() + 0.12
+        while time.time() < deadline:
+            current = _native_clipboard_text()
+            if not current or current == text:
+                return True
+            time.sleep(0.01)
+        return True
     if not _CLIPBOARD_AVAILABLE:
         return False
     try:
@@ -51,7 +81,7 @@ def _copy_to_clipboard(text: str) -> bool:
         return False
 
 
-def _wait_for_modifier_release(timeout_s: float = 0.45) -> None:
+def _wait_for_modifier_release(timeout_s: float = 0.8) -> None:
     if sys.platform != "darwin" or not _HOTKEYS_AVAILABLE or hotkeys is None:
         return
     deadline = time.time() + max(0.0, timeout_s)
@@ -109,17 +139,23 @@ def paste_text(
                 )
 
                 _wait_for_modifier_release()
-                if not accessibility_access_granted():
+                accessibility_ok = accessibility_access_granted()
+                if not accessibility_ok:
                     print("PASTE_WARNING accessibility_not_trusted", flush=True)
                 min_settle_delay = 20 if fast_path else 75
                 delivered = paste_clipboard_to_application(
                     active_app,
                     settle_delay_ms=max(min_settle_delay, paste_delay),
                     expected_text=text,
+                    verify=not fast_path,
                 )
                 if not delivered:
                     print("PASTE_FALLBACK accessibility_insert_after_shortcut", flush=True)
                     delivered = insert_text_into_focused_control(text, active_app)
+                if not delivered and not accessibility_ok:
+                    raise RuntimeError("macOS Accessibility permission is required for auto-paste.")
+            except RuntimeError:
+                raise
             except Exception:
                 delivered = False
         else:
@@ -130,7 +166,8 @@ def paste_text(
         if not delivered:
             raise RuntimeError("Paste shortcut was not delivered.")
         if restore_clipboard and _CLIPBOARD_AVAILABLE:
-            _restore_clipboard_later(old_clipboard)
+            restore_delay = max(1.2, min(3.0, 0.8 + len(text) / 3000.0))
+            _restore_clipboard_later(old_clipboard, delay=restore_delay)
         if auto_send and _HOTKEYS_AVAILABLE and hotkeys is not None:
             if not hotkeys.send("enter"):
                 raise RuntimeError("Auto-send shortcut was not delivered.")
