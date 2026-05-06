@@ -118,6 +118,7 @@ export const Btn = ({
   disabled,
   icon,
   style,
+  title,
 }: {
   children?: ReactNode;
   variant?: BtnVariant;
@@ -126,6 +127,7 @@ export const Btn = ({
   disabled?: boolean;
   icon?: IconName;
   style?: CSSProperties;
+  title?: string;
 }) => {
   const sizes = ({ sm: { h: 26, fs: 12, px: 10 }, md: { h: 32, fs: 13, px: 13 }, lg: { h: 38, fs: 14, px: 16 } } as const)[size];
   const base: CSSProperties = {
@@ -155,6 +157,8 @@ export const Btn = ({
     <button
       onClick={onClick}
       disabled={disabled}
+      title={title}
+      aria-label={title}
       style={{ ...base, ...variants[variant], ...style }}
       onMouseDown={(e) => !disabled && (e.currentTarget.style.transform = "translateY(1px)")}
       onMouseUp={(e) => !disabled && (e.currentTarget.style.transform = "")}

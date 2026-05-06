@@ -332,9 +332,17 @@ class Bridge(QObject):
     def addVocabularyWord(self, word: str) -> str:
         return self._window.add_vocabulary_word(word)
 
+    @pyqtSlot(str, result=str)
+    def deleteVocabularyWord(self, word: str) -> str:
+        return self._window.delete_vocabulary_word(word)
+
     @pyqtSlot(str, str, result=str)
     def addReplacementRule(self, match_text: str, replace_with: str) -> str:
         return self._window.add_replacement_rule(match_text, replace_with)
+
+    @pyqtSlot(int, result=str)
+    def deleteReplacementRule(self, rule_id: int) -> str:
+        return self._window.delete_replacement_rule(rule_id)
 
     @pyqtSlot(str, result=str)
     def copyText(self, text: str) -> str:
@@ -451,7 +459,9 @@ _BRIDGE_SHIM = r"""
         setMicrophone: function(value) { return callResult("setMicrophone", value); },
         setInputChannel: function(value) { return callResult("setInputChannel", value); },
         addVocabularyWord: function(word) { return callResult("addVocabularyWord", word); },
+        deleteVocabularyWord: function(word) { return callResult("deleteVocabularyWord", word); },
         addReplacementRule: function(matchText, replaceWith) { return callResult("addReplacementRule", matchText, replaceWith); },
+        deleteReplacementRule: function(ruleId) { return callResult("deleteReplacementRule", ruleId); },
         copyText: function(text) { return callResult("copyText", text); },
         transcribeLastDictation: function() { return callResult("transcribeLastDictation"); },
         runSttBenchmark: function() { return callResult("runSttBenchmark"); },
@@ -1506,7 +1516,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 headers={
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/6.0.3",
+                    "User-Agent": "Whisperer/6.0.4",
                     "Accept": "application/json",
                 },
                 method="GET",
@@ -1734,7 +1744,7 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
                 "https://api.groq.com/openai/v1/models",
                 {
                     "Authorization": f"Bearer {key}",
-                    "User-Agent": "Whisperer/6.0.3",
+                    "User-Agent": "Whisperer/6.0.4",
                     "Accept": "application/json",
                 },
             ),
@@ -2021,12 +2031,29 @@ print("WHISPERER_BACKUP_RESULT " + json.dumps({"text": final_text, "raw": raw_te
             add_word(word, source="manual")
         return self.vocabulary_snapshot_json()
 
+    def delete_vocabulary_word(self, word: str) -> str:
+        word = (word or "").strip()
+        if word:
+            from core.dictionary import delete_word
+
+            delete_word(word)
+        return self.vocabulary_snapshot_json()
+
     def add_replacement_rule(self, match_text: str, replace_with: str) -> str:
         match_text = (match_text or "").strip()
         if match_text:
             from core.dictionary import add_replacement_rule
 
             add_replacement_rule(match_text, replace_with or "")
+        return self.vocabulary_snapshot_json()
+
+    def delete_replacement_rule(self, rule_id: int) -> str:
+        try:
+            from core.dictionary import delete_replacement_rule
+
+            delete_replacement_rule(int(rule_id))
+        except Exception:
+            pass
         return self.vocabulary_snapshot_json()
 
     def _history_payload(self) -> dict[str, Any]:

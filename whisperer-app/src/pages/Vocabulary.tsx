@@ -47,6 +47,15 @@ export default function VocabPage({
     setNewReplace("");
   };
 
+  const deleteWord = (word: string) => {
+    if (!word) return;
+    window.whisperer?.deleteVocabularyWord?.(word).then(applySnapshot).catch(() => {});
+  };
+
+  const deleteRule = (ruleId: number) => {
+    window.whisperer?.deleteReplacementRule?.(ruleId).then(applySnapshot).catch(() => {});
+  };
+
   return (
     <div className="page-enter scroll" style={{ padding: "22px 28px 40px", overflow: "auto", height: "100%" }}>
       <div style={{ display: "flex", alignItems: "flex-end", gap: 16, marginBottom: 18 }}>
@@ -87,7 +96,7 @@ export default function VocabPage({
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1.4fr 70px 90px",
+                gridTemplateColumns: "1.4fr 70px 90px 38px",
                 padding: "11px 16px",
                 borderBottom: "1px solid var(--line)",
                 fontSize: 11,
@@ -101,13 +110,14 @@ export default function VocabPage({
               <span>Word</span>
               <span style={{ textAlign: "right" }}>Uses</span>
               <span style={{ textAlign: "right" }}>Source</span>
+              <span></span>
             </div>
             {visibleWords.map((v, i) => (
               <div
                 key={`${v.word}-${i}`}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "1.4fr 70px 90px",
+                  gridTemplateColumns: "1.4fr 70px 90px 38px",
                   padding: "11px 16px",
                   alignItems: "center",
                   borderTop: i === 0 ? "none" : "1px solid var(--line-soft)",
@@ -116,6 +126,16 @@ export default function VocabPage({
                 <span className="mono" style={{ fontSize: 13, color: "var(--ink)", fontWeight: 500 }}>{v.word}</span>
                 <span className="mono" style={{ fontSize: 12, color: "var(--ink-3)", textAlign: "right" }}>{v.count}</span>
                 <span style={{ fontSize: 12, color: "var(--ink-3)", textAlign: "right" }}>{v.source || "unknown"}</span>
+                <span style={{ textAlign: "right" }}>
+                  <Btn
+                    variant="ghost"
+                    size="sm"
+                    icon="trash"
+                    title={`Delete ${v.word}`}
+                    onClick={() => deleteWord(v.word)}
+                    style={{ width: 28, padding: 0, justifyContent: "center", color: "var(--rec)" }}
+                  />
+                </span>
               </div>
             ))}
             {hiddenWords > 0 && (
@@ -143,7 +163,7 @@ export default function VocabPage({
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1fr 24px 1fr 70px",
+                gridTemplateColumns: "1fr 24px 1fr 70px 38px",
                 padding: "11px 16px",
                 borderBottom: "1px solid var(--line)",
                 fontSize: 11,
@@ -159,13 +179,14 @@ export default function VocabPage({
               <span></span>
               <span>Replace with</span>
               <span style={{ textAlign: "right" }}>Enabled</span>
+              <span></span>
             </div>
             {visibleReplacements.map((v, i) => (
               <div
                 key={v.id}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "1fr 24px 1fr 70px",
+                  gridTemplateColumns: "1fr 24px 1fr 70px 38px",
                   padding: "11px 16px",
                   alignItems: "center",
                   gap: 4,
@@ -178,6 +199,16 @@ export default function VocabPage({
                 </span>
                 <span className="mono" style={{ fontSize: 12.5, color: "var(--accent-ink)", fontWeight: 500 }}>{v.replace_with}</span>
                 <span style={{ fontSize: 12, color: "var(--ink-3)", textAlign: "right" }}>{v.enabled ? "yes" : "no"}</span>
+                <span style={{ textAlign: "right" }}>
+                  <Btn
+                    variant="ghost"
+                    size="sm"
+                    icon="trash"
+                    title={`Delete ${v.match_text}`}
+                    onClick={() => deleteRule(v.id)}
+                    style={{ width: 28, padding: 0, justifyContent: "center", color: "var(--rec)" }}
+                  />
+                </span>
               </div>
             ))}
             {hiddenReplacements > 0 && (

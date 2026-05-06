@@ -198,6 +198,24 @@ def get_word_count() -> int:
     conn.close()
     return count
 
+
+def delete_word(word: str) -> bool:
+    """Delete a vocabulary word by its normalized text."""
+    raw_word = normalize_term(word)
+    word = raw_word.lower()
+    if not word:
+        return False
+
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM words WHERE word = ?", (word,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    _invalidate_caches()
+    return deleted
+
+
 def clear_dict():
     """Clear all words from the dictionary."""
     conn = _get_connection()
@@ -259,14 +277,16 @@ def add_replacement_rule(
     return rule_id
 
 
-def delete_replacement_rule(rule_id: int):
+def delete_replacement_rule(rule_id: int) -> bool:
     """Delete a replacement rule by id."""
     conn = _get_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM replacement_rules WHERE id = ?", (rule_id,))
+    deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
     _invalidate_caches()
+    return deleted
 
 
 def get_replacement_rules(enabled_only: bool = False) -> List[dict]:
