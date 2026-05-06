@@ -46,7 +46,7 @@ NVIDIA_RIVA_FUNCTION_IDS = {
     "parakeet-1.1b-rnnt-multilingual-asr": "71203149-d3b7-4460-8231-1be2543a1fca",
     "parakeet-1.1b-rnnt-multilingual": "71203149-d3b7-4460-8231-1be2543a1fca",
 }
-API_USER_AGENT = "Whisperer/6.0.5"
+API_USER_AGENT = "Whisperer/6.0.6"
 _RIVA_CLIENT_CACHE: dict[tuple[str, str, str, str, str], tuple[object, object]] = {}
 _RIVA_CLIENT_LOCK = threading.Lock()
 

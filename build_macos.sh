@@ -50,6 +50,18 @@ python -m pip install pyinstaller
 pyinstaller --noconfirm whisperer-macos.spec
 scripts/sign_macos_app.sh dist/Whisperer.app
 scripts/create_macos_dmg.sh
+scripts/sign_macos_dmg.sh dist/Whisperer-macOS-arm64.dmg
+
+REQUIRE_NOTARIZATION="${WHISPERER_REQUIRE_NOTARIZATION:-0}"
+if [[ "${WHISPERER_ALLOW_ADHOC_SIGNING:-0}" == "1" ]]; then
+  echo "Skipping notarization for explicit ad-hoc local build."
+elif [[ "${WHISPERER_SKIP_NOTARIZATION:-0}" == "1" ]]; then
+  echo "Skipping notarization by request. Do not publish this DMG."
+else
+  scripts/notarize_macos_dmg.sh dist/Whisperer-macOS-arm64.dmg
+  REQUIRE_NOTARIZATION=1
+fi
+WHISPERER_REQUIRE_NOTARIZATION="$REQUIRE_NOTARIZATION" scripts/verify_macos_release.sh dist/Whisperer-macOS-arm64.dmg
 
 echo "Built dist/Whisperer.app"
 echo "Built dist/Whisperer-macOS-arm64.dmg"
