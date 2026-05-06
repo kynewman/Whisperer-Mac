@@ -96,7 +96,7 @@ export default function VocabPage({
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1.4fr 70px 90px 38px",
+                gridTemplateColumns: "1.4fr 70px 90px 86px",
                 padding: "11px 16px",
                 borderBottom: "1px solid var(--line)",
                 fontSize: 11,
@@ -117,7 +117,7 @@ export default function VocabPage({
                 key={`${v.word}-${i}`}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "1.4fr 70px 90px 38px",
+                  gridTemplateColumns: "1.4fr 70px 90px 86px",
                   padding: "11px 16px",
                   alignItems: "center",
                   borderTop: i === 0 ? "none" : "1px solid var(--line-soft)",
@@ -128,13 +128,15 @@ export default function VocabPage({
                 <span style={{ fontSize: 12, color: "var(--ink-3)", textAlign: "right" }}>{v.source || "unknown"}</span>
                 <span style={{ textAlign: "right" }}>
                   <Btn
-                    variant="ghost"
+                    variant="danger"
                     size="sm"
                     icon="trash"
                     title={`Delete ${v.word}`}
                     onClick={() => deleteWord(v.word)}
-                    style={{ width: 28, padding: 0, justifyContent: "center", color: "var(--rec)" }}
-                  />
+                    style={{ justifyContent: "center" }}
+                  >
+                    Delete
+                  </Btn>
                 </span>
               </div>
             ))}
@@ -163,7 +165,7 @@ export default function VocabPage({
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1fr 24px 1fr 70px 38px",
+                gridTemplateColumns: "1fr 24px 1fr 70px 86px",
                 padding: "11px 16px",
                 borderBottom: "1px solid var(--line)",
                 fontSize: 11,
@@ -186,7 +188,7 @@ export default function VocabPage({
                 key={v.id}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "1fr 24px 1fr 70px 38px",
+                  gridTemplateColumns: "1fr 24px 1fr 70px 86px",
                   padding: "11px 16px",
                   alignItems: "center",
                   gap: 4,
@@ -201,13 +203,15 @@ export default function VocabPage({
                 <span style={{ fontSize: 12, color: "var(--ink-3)", textAlign: "right" }}>{v.enabled ? "yes" : "no"}</span>
                 <span style={{ textAlign: "right" }}>
                   <Btn
-                    variant="ghost"
+                    variant="danger"
                     size="sm"
                     icon="trash"
                     title={`Delete ${v.match_text}`}
                     onClick={() => deleteRule(v.id)}
-                    style={{ width: 28, padding: 0, justifyContent: "center", color: "var(--rec)" }}
-                  />
+                    style={{ justifyContent: "center" }}
+                  >
+                    Delete
+                  </Btn>
                 </span>
               </div>
             ))}
