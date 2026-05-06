@@ -12,7 +12,7 @@ from core.providers import LLMProvider
 
 
 log = logging.getLogger("whisperer.llm")
-API_USER_AGENT = "Whisperer/6.0.4"
+API_USER_AGENT = "Whisperer/6.0.5"
 
 
 BUILTIN_PROMPT_TEMPLATES: Dict[str, str] = {
